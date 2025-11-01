@@ -1,0 +1,8 @@
+<mujoco>
+  <worldbody>
+    <body name="body" pos="0 0 0">
+      <inertial mass=".200" pos="0 0 0" diaginertia="0.000267 0.000267 0.000267"/>
+      <geom name="object" type="box" size="0.02 0.02 0.02" rgba=".5 .7 .5 1" friction=".5" priority="1" solref="0.01 1" solimp=".9 .95 .0001"/>
+    </body>
+  </worldbody>
+</mujoco>
