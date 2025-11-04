@@ -1,0 +1,98 @@
+# System Configuration
+# Warehouse Sorting MPC + Vision
+
+# Robot Configuration
+robot:
+  type: "UR7e"
+  ip_address: "192.168.1.100"  # Update with actual robot IP
+  n_joints: 6
+  home_position: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]  # Joint angles in radians
+  
+# Gripper Configuration
+gripper:
+  type: "Robotiq 2f-85"
+  default_force: 100  # 0-255
+  open_position: 0
+  closed_position: 255
+
+# Camera Configuration
+camera:
+  type: "RealSense D435"
+  width: 640
+  height: 480
+  fps: 30
+  depth_scale: 0.001  # Depth units to meters
+
+# MPC Parameters
+mpc:
+  horizon: 20
+  dt: 0.01  # Time step in seconds
+  max_iterations: 100
+  convergence_threshold: 1e-4
+  
+  # Cost weights
+  weights:
+    position_error: 10.0
+    velocity: 0.1
+    control_effort: 0.01
+  
+  # Constraints
+  joint_limits:
+    lower: [-6.28, -6.28, -6.28, -6.28, -6.28, -6.28]
+    upper: [6.28, 6.28, 6.28, 6.28, 6.28, 6.28]
+  velocity_limits: 2.0  # rad/s
+  acceleration_limits: 5.0  # rad/s^2
+  
+  # Collision avoidance
+  min_obstacle_distance: 0.05  # meters
+
+# Object Detection
+detection:
+  model_type: "yolo"
+  model_path: "data/models/yolo_weights.pt"
+  confidence_threshold: 0.5
+  nms_threshold: 0.4
+  
+  # Object classes
+  classes:
+    0: "cube_red"
+    1: "cube_blue"
+    2: "cylinder_green"
+    3: "box_yellow"
+
+# Grasp Prediction
+grasp_predictor:
+  model_type: "random_forest"
+  model_path: "data/models/grasp_predictor.pkl"
+  success_threshold: 0.5  # Minimum predicted probability to attempt grasp
+  n_pose_samples: 10  # Number of poses to sample for optimization
+
+# Sorting Zones
+sorting_zones:
+  cube_red: [0.3, -0.4, 0.1]
+  cube_blue: [0.3, 0.4, 0.1]
+  cylinder_green: [-0.3, -0.4, 0.1]
+  box_yellow: [-0.3, 0.4, 0.1]
+  default: [0.0, -0.5, 0.1]
+
+# Workspace Bounds
+workspace:
+  x_range: [-0.5, 0.5]
+  y_range: [-0.6, 0.6]
+  z_range: [0.0, 0.8]
+
+# Data Collection
+data_collection:
+  enabled: false
+  save_directory: "data/raw"
+  save_frequency: 10  # Save every N grasp attempts
+
+# Testing and Evaluation
+evaluation:
+  baseline_controller: "PID"
+  metrics:
+    - "grasp_success_rate"
+    - "average_cycle_time"
+    - "mpc_solve_time"
+    - "trajectory_smoothness"
+
