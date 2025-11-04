@@ -22,17 +22,24 @@ env/
 *.swo
 *~
 
-# Data files
+# Data files (training data and models)
 data/raw/*.npz
 data/raw/*.json
 data/processed/*.png
 data/models/*.pth
 data/models/*.png
 
+# Diagnostic outputs
+data/diagnostics/*.npz
+data/diagnostics/*.json
+data/diagnostics/*.png
+data/diagnostics/*.txt
+
 # Keep directory structure
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/models/.gitkeep
+!data/diagnostics/.gitkeep
 
 # Logs
 *.log
@@ -51,6 +58,7 @@ logs/
 # Temporary files
 *.tmp
 *.bak
+*.swp
 
-# UV lock file (optional - keep or remove based on preference)
+# UV/uv lock file (optional - uncomment to ignore)
 # uv.lock

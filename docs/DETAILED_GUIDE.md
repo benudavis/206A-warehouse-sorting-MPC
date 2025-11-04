@@ -311,6 +311,68 @@ To improve model during deployment:
 
 ---
 
+## Diagnostic Framework
+
+The diagnostic framework (`src/diagnostics/`) provides comprehensive logging and visualization for debugging manipulation tasks.
+
+### Quick Usage
+
+```python
+from src.diagnostics import DiagnosticLogger
+
+# Initialize
+logger = DiagnosticLogger(model, data, site_name="arm_hand_pinch")
+logger.add_tracked_object("red_box", body_id, size=0.02)
+
+# Log during operation
+logger.log_state("red_box", "approach", attempt=0)
+logger.log_ik_result("red_box", "grasp", target_pos, achieved_pos, success=True)
+logger.log_mpc_convergence("red_box", "move", target_joints, steps=150, converged=True)
+logger.log_lift_test("red_box", attempt=0, baseline_z=0.52, new_z=0.53)
+
+# Generate report
+logger.generate_report(output_dir="data/diagnostics")
+```
+
+### Generated Outputs
+
+**Visualizations (12-subplot report):**
+- 3D trajectory and 2D projections
+- Distance metrics over time
+- Gripper behavior
+- Joint trajectories
+- Lift test results
+- Phase-by-phase analysis
+
+**Data Files:**
+- `logs_*.npz` - Raw state data
+- `events_*.json` - IK/MPC/lift events
+- `summary_*.json` - Statistics
+- `metrics_*.txt` - Performance report
+- `report_*.png` - Visualizations
+
+**Metrics:**
+- IK convergence rate and errors
+- MPC convergence rate and steps
+- Lift success rates
+- Distance statistics
+- Timing analysis
+- Automatic failure mode identification
+
+### Key Methods
+
+- `log_state()` - Periodic state logging (every 20 steps)
+- `log_ik_result()` - IK solver results
+- `log_mpc_convergence()` - MPC convergence
+- `log_lift_test()` - Grasp verification
+- `log_grasp_attempt()` - Complete grasp attempt
+- `add_warning()` / `add_error()` - Log issues
+- `generate_report()` - Create comprehensive analysis
+
+See `scripts/demo_sorting_with_diagnostics.py` for complete example.
+
+---
+
 ## References
 
 **MPC:**
