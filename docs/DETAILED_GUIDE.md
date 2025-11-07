@@ -1,395 +1,123 @@
 # Detailed Project Guide
 
-## Table of Contents
-
-1. [MPC Controller](#mpc-controller)
-2. [Data Collection](#data-collection)
-3. [Neural Network Training](#neural-network-training)
-4. [Evaluation](#evaluation)
-5. [Configuration](#configuration)
-6. [Troubleshooting](#troubleshooting)
+This repository contains a single end-to-end demonstration: a UR5e arm picks three
+cubes from the table and places them onto an elevated shelf from smallest to
+largest. The sections below describe how the demo works and how to extend or debug
+it.
 
 ---
 
-## MPC Controller
+## 1. Scene & Task
 
-### Overview
+- **Table:** Base surface that holds the objects at `z = 0.52 m`
+- **Shelf:** Box geometry positioned at `[0.60, -0.25, 0.70]` (≈28 cm above table)
+- **Objects:** Three cubes with half-extent sizes `[0.02, 0.025, 0.03]` meters
+- **Goal:** Sort cubes by size (small → medium → large) from left to right on the
+  shelf positions `[0.52, 0.60, 0.68]`
 
-The MPC controller (`src/control/mpc_controller.py`) implements position-space trajectory optimization for robots with position servos (like the UR5e).
-
-### Formulation
-
-```
-minimize:   Σ ||q_k - q_target||²_Q              (position error)
-          + Σ ||q_k - q_{k-1}||²_R               (smoothness)
-          + ||q_N - q_target||²_{Q_terminal}     (terminal cost)
-
-subject to: q_0 = q_current                      (initial condition)
-            |q_{k+1} - q_k|/dt ≤ v_max          (velocity limits)
-            q_min ≤ q_k ≤ q_max                 (joint limits)
-```
-
-### Tuning Parameters
-
-**Default settings (optimized):**
-- `horizon = 30` - Prediction horizon
-- `Q = 500` - Position error weight
-- `Q_terminal = 1000` - Terminal cost weight
-- `R = 0.1` - Smoothness weight
-- `max_velocity = 5.0` rad/s
-
-**Tuning guidelines:**
-- ↑ Q/Q_terminal → More aggressive tracking
-- ↑ R → Smoother motion
-- ↑ horizon → Better planning, slower computation
-- ↑ max_velocity → Faster motion
-
-### Performance
-
-- **Success rate:** ~100% on reachable targets
-- **Convergence:** ~100-300 steps depending on distance
-- **Error reduction:** 96%+
-- **Computation time:** ~50ms per step (with warm starting)
+All geometry is defined directly in `scripts/demo_sorting.py` using MuJoCo's API.
 
 ---
 
-## Data Collection
+## 2. Control Pipeline (`scripts/demo_sorting.py`)
 
-### Script: `scripts/collect_mpc_data.py`
+1. **Inverse Kinematics** (`src/control/inverse_kinematics.py`)
+   - Targets the end-effector site `arm_hand_pinch`
+   - First solves for a pose 10 cm above the cube, then 3 cm above the surface
+   - Uses a tool-down quaternion `[0, 1, 0, 0]`
 
-**Purpose:** Run MPC on random targets and record demonstrations.
+2. **Model Predictive Control** (`src/control/mpc_controller.py`)
+   - Drives the 6 UR5e joints to the IK solution
+   - Horizon: 30 steps, dt: 0.01 s, position weight: 500, terminal weight: 1000
+   - If the solver fails, the code falls back to simple position interpolation
 
-**Key observations (32-dimensional):**
-- Robot state (12): joint positions + velocities
-- End effector pose (7): position + orientation
-- Object pose (7): position + orientation  
-- Target position (6): desired joint angles
+3. **Manual Attachment for Grasping**
+   - When the EE is within 8 cm of the cube, the script records the EE→object
+     offset
+   - While the gripper is "closed", the object's free joint position follows the
+     end-effector (simulating a perfect friction grasp)
 
-**Actions (6-dimensional):**
-- Next desired joint positions from MPC
-
-### Usage
-
-```bash
-# Standard collection
-uv run python scripts/collect_mpc_data.py \
-    --episodes 50 \
-    --steps 300
-
-# Quick test
-uv run python scripts/collect_mpc_data.py \
-    --episodes 10 \
-    --steps 100
-```
-
-**Output:**
-- `data/raw/mpc_data_TIMESTAMP.npz` - Observations and actions
-- `data/raw/mpc_metadata_TIMESTAMP.json` - Collection metadata
-
-### Data Quality
-
-Good data collection requires:
-- ✅ Diverse target positions
-- ✅ MPC successfully reaching most targets
-- ✅ Sufficient episode length (300 steps recommended)
-- ✅ No solver failures
-
-**Tip:** Check metadata file for success statistics.
+4. **Shelf Placement**
+   - After lifting ~0.9 radians in shoulder joint, the object is carried to the
+     shelf IK target and released
+   - A short settle period lets physics place the cube on the platform
 
 ---
 
-## Neural Network Training
+## 3. Diagnostics & Logging
 
-### Architecture
+The diagnostic utilities in `src/diagnostics/` are optional but useful when the
+motion needs debugging.
 
-```
-Input (32) → FC(128) → ReLU → LayerNorm →
-             FC(128) → ReLU → LayerNorm →
-             FC(64)  → ReLU → LayerNorm →
-             FC(6)   → Output
-```
-
-### Training Process
-
-The network learns:
-```
-observation → action
-(current state + target) → (next position)
-```
-
-**Data normalization:**
-- Observations: zero mean, unit variance
-- Actions: zero mean, unit variance
-- Applied during training, inverted during inference
-
-### Usage
-
-```bash
-uv run python scripts/train_imitator.py \
-    --data data/raw/mpc_data_TIMESTAMP.npz \
-    --epochs 150 \
-    --batch-size 128 \
-    --lr 0.001
-```
-
-**Hyperparameters:**
-- `--epochs`: Training epochs (150 recommended)
-- `--batch-size`: Batch size (64-128 works well)
-- `--lr`: Learning rate (0.001 default)
-- `--hidden`: Network architecture (e.g., `--hidden 256 256 128`)
-
-### Expected Results
-
-**Good training:**
-- Train loss < 0.001 after 50 epochs
-- Val loss < 0.001 and stable
-- Smooth loss curves
-
-**Red flags:**
-- Val loss increasing → Overfitting
-- Loss not decreasing → Learning rate too low or bad data
-- Oscillating loss → Learning rate too high
-
----
-
-## Evaluation
-
-### Script: `scripts/evaluate_imitator.py`
-
-Compares MPC (expert) vs learned controller on random targets.
-
-**Metrics:**
-- Success rate (% reaching target)
-- Average steps to target
-- Final position error
-- Trajectory plots
-
-### Usage
-
-```bash
-uv run python scripts/evaluate_imitator.py \
-    --model data/models/mpc_imitator_TIMESTAMP.pth \
-    --trials 20
-```
-
-**Output:**
-- Console: Success rates, average steps, errors
-- `data/processed/evaluation_results.png` - Comparison plots
-
-### Interpreting Results
-
-**Success criteria:**
-- Position error < 0.05 rad within 400 steps
-
-**Good performance:**
-- Learned success rate ≥ 80% of MPC success rate
-- Learned steps ≤ 1.5x MPC steps
-- Similar error trajectories
-
----
-
-## Configuration
-
-### File: `config/system_config.yaml`
-
-**MPC settings:**
-```yaml
-mpc:
-  horizon: 30
-  dt: 0.01
-  weights:
-    position_error: 500.0
-    terminal: 1000.0
-    smoothness: 0.1
-```
-
-**Robot settings:**
-```yaml
-robot:
-  n_joints: 6
-  joint_limits:
-    lower: [-6.28, -6.28, -6.28, -6.28, -6.28, -6.28]
-    upper: [6.28, 6.28, 6.28, 6.28, 6.28, 6.28]
-  max_velocity: 5.0
-```
-
-**Training settings:**
-```yaml
-training:
-  epochs: 150
-  batch_size: 128
-  learning_rate: 0.001
-  hidden_dims: [128, 128, 64]
-```
-
----
-
-## Troubleshooting
-
-### MPC Issues
-
-**Problem:** MPC not converging
-- **Solution:** Increase `Q` and `Q_terminal` weights
-- **Solution:** Increase horizon
-- **Solution:** Check joint limits aren't too restrictive
-
-**Problem:** MPC too slow
-- **Solution:** Decrease horizon
-- **Solution:** Increase acceptable_tol in solver options
-- **Solution:** Use warm starting (already enabled)
-
-### Data Collection Issues
-
-**Problem:** Many solver failures
-- **Solution:** Use easier targets (smaller changes)
-- **Solution:** Increase max_velocity
-- **Solution:** Check simulation timestep
-
-**Problem:** Not enough diversity
-- **Solution:** Increase number of episodes
-- **Solution:** Widen target distribution bounds
-
-### Training Issues
-
-**Problem:** High training loss
-- **Solution:** Train longer (more epochs)
-- **Solution:** Increase network size
-- **Solution:** Decrease learning rate
-
-**Problem:** Overfitting (high val loss)
-- **Solution:** Collect more data
-- **Solution:** Add regularization
-- **Solution:** Smaller network
-
-**Problem:** Model doesn't work at inference
-- **Solution:** Check observation includes target!
-- **Solution:** Verify normalization applied correctly
-- **Solution:** Check model input dimensions match training
-
-### macOS Specific
-
-**Problem:** `mjpython` library error
-```bash
-# Solution: Create symlink
-mkdir -p .venv/lib
-ln -sf ~/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/libpython3.12.dylib .venv/lib/libpython3.12.dylib
-```
-
-**Problem:** PyTorch load error
-```bash
-# Solution: Already fixed in code with weights_only=False
-```
-
----
-
-## Advanced Topics
-
-### Adding Vision
-
-To replace state observations with camera images:
-
-1. Modify `src/perception/sim_state.py` to capture RGB images
-2. Change network to CNN architecture
-3. Update observation dimension in training
-
-### Real Robot Deployment
-
-To deploy on actual UR7e:
-
-1. Implement `src/control/robot_interface.py` with URX library
-2. Test MPC in sim with same control frequency
-3. Collect initial data on real robot
-4. Fine-tune with real-world data
-
-### Online Learning
-
-To improve model during deployment:
-
-1. Record (observation, MPC action) during execution
-2. Periodically retrain model
-3. Use DAgger algorithm for iterative improvement
-
----
-
-## Diagnostic Framework
-
-The diagnostic framework (`src/diagnostics/`) provides comprehensive logging and visualization for debugging manipulation tasks.
-
-### Quick Usage
+### Quick Usage Example
 
 ```python
 from src.diagnostics import DiagnosticLogger
 
-# Initialize
 logger = DiagnosticLogger(model, data, site_name="arm_hand_pinch")
-logger.add_tracked_object("red_box", body_id, size=0.02)
+logger.add_tracked_object("red_small", mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_small"))
 
-# Log during operation
-logger.log_state("red_box", "approach", attempt=0)
-logger.log_ik_result("red_box", "grasp", target_pos, achieved_pos, success=True)
-logger.log_mpc_convergence("red_box", "move", target_joints, steps=150, converged=True)
-logger.log_lift_test("red_box", attempt=0, baseline_z=0.52, new_z=0.53)
+# Inside control loop
+logger.log_state("red_small", phase="approach", attempt=0)
 
-# Generate report
+# After run
 logger.generate_report(output_dir="data/diagnostics")
 ```
 
-### Generated Outputs
-
-**Visualizations (12-subplot report):**
-- 3D trajectory and 2D projections
-- Distance metrics over time
-- Gripper behavior
-- Joint trajectories
-- Lift test results
-- Phase-by-phase analysis
-
-**Data Files:**
-- `logs_*.npz` - Raw state data
-- `events_*.json` - IK/MPC/lift events
-- `summary_*.json` - Statistics
-- `metrics_*.txt` - Performance report
-- `report_*.png` - Visualizations
-
-**Metrics:**
-- IK convergence rate and errors
-- MPC convergence rate and steps
-- Lift success rates
-- Distance statistics
-- Timing analysis
-- Automatic failure mode identification
-
-### Key Methods
-
-- `log_state()` - Periodic state logging (every 20 steps)
-- `log_ik_result()` - IK solver results
-- `log_mpc_convergence()` - MPC convergence
-- `log_lift_test()` - Grasp verification
-- `log_grasp_attempt()` - Complete grasp attempt
-- `add_warning()` / `add_error()` - Log issues
-- `generate_report()` - Create comprehensive analysis
-
-See `scripts/demo_sorting_with_diagnostics.py` for complete example.
+**Report contents:** 12-subplot figure (3D trajectory, distances, gripper, joint
+traces, lift tests), JSON/NPZ raw logs, and text metrics (IK/MPC convergence,
+lift success, distance statistics).
 
 ---
 
-## References
+## 4. Key Parameters
 
-**MPC:**
-- CasADi documentation: https://web.casadi.org/
-- Rawlings, J. B., & Mayne, D. Q. (2009). Model predictive control: Theory and design.
-
-**Imitation Learning:**
-- Ross, S., Gordon, G., & Bagnell, D. (2011). A reduction of imitation learning and structured prediction to no-regret online learning.
-- Pomerleau, D. A. (1988). Alvinn: An autonomous land vehicle in a neural network.
-
-**Robot Control:**
-- MuJoCo documentation: https://mujoco.readthedocs.io/
-- Universal Robots documentation
+| Component | Variable | Default | Notes |
+|-----------|----------|---------|-------|
+| MPC horizon | `horizon` | 30 | Increase for smoother but slower plans |
+| MPC dt | `dt` | 0.01 s | Keep stable with Mujoco timestep (`0.0001`) |
+| IK tolerance | `tolerance` | 0.02 m | Relax if IK struggles, tighten for precision |
+| Grasp distance | `0.08 m` | Determines whether the object attaches |
+| Shelf targets | `shelf_positions` | `[0.52, 0.60, 0.68]` | Left → right placement |
 
 ---
 
-## Contact
+## 5. Troubleshooting
 
-For questions about this project, contact the team members through the course staff.
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Cube not picked up | EE too far before closing | Adjust approach tolerances or decrease grasp distance threshold |
+| Arm oscillates near target | MPC not converging | Increase horizon or terminal weight; fall back to interpolation block |
+| Object falls during move | Attachment offset not captured | Ensure `distance < 0.08` before closing; optionally raise threshold |
+| Arm clips shelf | Shelf target too close | Modify `shelf_positions` or increase `target_above` height |
+| Solver errors (CasADi) | Poor initial guess | Use last joint state as warm start or reduce horizon |
+
+---
+
+## 6. Useful Entry Points
+
+| File | Purpose |
+|------|---------|
+| `scripts/demo_sorting.py` | Main demo script (scene + control pipeline) |
+| `src/control/mpc_controller.py` | MPC implementation |
+| `src/control/inverse_kinematics.py` | IK solver |
+| `src/perception/sim_state.py` | Extracts robot state for MPC |
+| `src/diagnostics/logger.py` | Core logging utilities |
+
+---
+
+## 7. Extending the Demo
+
+- Adjust cube positions or add new shelf slots by editing the arrays near the top
+  of `demo_sorting.py`
+- Change sorting order (e.g., largest → smallest) by modifying the sort key
+- Swap manual attachment with a physics-based grasp by removing the offset logic
+  and tuning MuJoCo friction coefficients
+- Log additional objects by registering them with `DiagnosticLogger`
+
+---
+
+Enjoy experimenting with the shelf sorting demo! The code is intentionally
+compact so that the entire control loop fits in a single script and can be read
+from top to bottom.
 

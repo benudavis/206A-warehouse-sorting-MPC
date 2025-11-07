@@ -387,7 +387,7 @@ class DiagnosticLogger:
             tracked_objects=self.tracked_objects,
             object_metadata=self.object_metadata,
         )
-        print(f"  📁 Saved raw logs: {logs_file}")
+        print(f"  Saved raw logs: {logs_file}")
         
         # Save events
         events_file = output_dir / f"events_{self.session_id}.json"
@@ -404,7 +404,7 @@ class DiagnosticLogger:
         
         with open(events_file, 'w') as f:
             json.dump(events_data, f, indent=2)
-        print(f"  📁 Saved events: {events_file}")
+        print(f"  Saved events: {events_file}")
         
         # Save summary statistics
         summary_file = output_dir / f"summary_{self.session_id}.json"
@@ -419,7 +419,7 @@ class DiagnosticLogger:
         
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
-        print(f"  📁 Saved summary: {summary_file}")
+        print(f"  Saved summary: {summary_file}")
         
         return logs_file, events_file, summary_file
     
@@ -458,7 +458,7 @@ class DiagnosticLogger:
             if save_plots:
                 plot_file = output_dir / f"report_{obj_name}_{self.session_id}.png"
                 fig.savefig(plot_file, dpi=150, bbox_inches='tight')
-                print(f"    📊 Saved plot: {plot_file}")
+                print(f"    Saved plot: {plot_file}")
             
             if show_plots:
                 import matplotlib.pyplot as plt
@@ -474,7 +474,7 @@ class DiagnosticLogger:
         metrics_file = output_dir / f"metrics_{self.session_id}.txt"
         with open(metrics_file, 'w') as f:
             f.write(metrics_report)
-        print(f"\n  📊 Saved metrics report: {metrics_file}")
+        print(f"\n  Saved metrics report: {metrics_file}")
         
         print(f"\n{'='*70}")
         print(f"REPORT GENERATION COMPLETE")

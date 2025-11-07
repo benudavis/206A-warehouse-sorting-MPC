@@ -18,10 +18,8 @@ This project implements Model Predictive Control (MPC) for a UR5e robotic arm an
 **Key Components:**
 - ✅ Position-space MPC using CasADi optimization
 - ✅ Inverse kinematics for reach planning
-- ✅ Neural network for behavior cloning
-- ✅ Complete data collection and training pipeline
-- ✅ Warehouse-style object sorting demonstration
-- ✅ Comprehensive diagnostic and logging framework
+- ✅ Shelf-based warehouse sorting demonstration
+- ✅ Diagnostic and logging utilities for debugging
 
 ---
 
@@ -38,47 +36,14 @@ mkdir -p .venv/lib
 ln -sf ~/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/lib/libpython3.12.dylib .venv/lib/libpython3.12.dylib
 ```
 
-### Run Demos
+### Run Demo
 
 ```bash
-# Basic warehouse sorting demo
 uv run mjpython scripts/demo_sorting.py
-
-# Sorting with comprehensive diagnostics (recommended for debugging)
-uv run mjpython scripts/demo_sorting_with_diagnostics.py
-
-# Shelf sorting demo
-uv run mjpython scripts/demo_shelf_sorting.py
-
-# MPC vs learned controller comparison
-uv run mjpython scripts/demo_comparison.py --mode mpc
 ```
 
----
-
-## MPC Imitation Learning Pipeline
-
-Complete workflow from data collection to evaluation:
-
-```bash
-# 1. Collect MPC demonstrations
-uv run python scripts/collect_mpc_data.py --episodes 50 --steps 300
-
-# 2. Train neural network
-uv run python scripts/train_imitator.py \
-    --data data/raw/mpc_data_TIMESTAMP.npz \
-    --epochs 150
-
-# 3. Evaluate performance
-uv run python scripts/evaluate_imitator.py \
-    --model data/models/mpc_imitator_TIMESTAMP.pth \
-    --trials 20
-
-# 4. Visual comparison (MPC vs learned)
-uv run mjpython scripts/demo_comparison.py \
-    --mode learned \
-    --model data/models/mpc_imitator_TIMESTAMP.pth
-```
+This launches the shelf-sorting simulation: the UR5e picks cubes from the table and
+places them on the elevated shelf from smallest to largest.
 
 ---
 
@@ -95,7 +60,8 @@ logger.log_state("red_box", "approach", attempt=0)
 logger.generate_report(output_dir="data/diagnostics")
 ```
 
-Generates 12-subplot visualizations, metrics, and failure analysis. See `scripts/demo_sorting_with_diagnostics.py` and `docs/DETAILED_GUIDE.md`.
+Generates 12-subplot visualizations, metrics, and failure analysis. See
+`docs/DETAILED_GUIDE.md` for full diagnostics usage examples.
 
 ---
 
@@ -115,13 +81,7 @@ Generates 12-subplot visualizations, metrics, and failure analysis. See `scripts
 │       ├── plotter.py                # Visualizations
 │       └── metrics.py                # Performance metrics
 ├── scripts/
-│   ├── demo_sorting.py               # Basic sorting demo
-│   ├── demo_sorting_with_diagnostics.py  # Sorting with logging
-│   ├── demo_shelf_sorting.py         # Shelf sorting demo
-│   ├── collect_mpc_data.py           # Data collection
-│   ├── train_imitator.py             # Neural network training
-│   ├── evaluate_imitator.py          # Performance evaluation
-│   └── demo_comparison.py            # MPC vs learned comparison
+│   └── demo_sorting.py               # Shelf sorting demo
 ├── config/
 │   └── system_config.yaml            # System configuration
 ├── data/
@@ -139,23 +99,17 @@ Generates 12-subplot visualizations, metrics, and failure analysis. See `scripts
 
 ## Results
 
-### MPC Performance
-- Successfully reaches targets in ~100-300 steps
-- 96%+ error reduction
-- Smooth, optimal trajectories
-- Real-time control at 100Hz simulation rate
-
-### Imitation Learning
-- 15,000+ expert demonstrations collected
-- Neural network training converges (loss < 0.0001)
-- Complete pipeline from collection to deployment
-- Evaluation framework with metrics
+### Shelf Sorting Demo
+- Picks three cubes from the table
+- Places them on the shelf left → right in ascending size
+- Manual attachment guarantees a reliable grasp for demonstration purposes
+- Runs in real time with the MuJoCo viewer
 
 ### Diagnostic Framework
-- Automatic data collection (robot state, object poses, distances)
-- 12-subplot comprehensive visualizations
-- Performance metrics (IK/MPC convergence rates, timing)
-- Failure mode identification (lift tests, distance analysis)
+- Optional logging of robot/object state
+- Generates 12-subplot visual reports (trajectories, distances, gripper)
+- Computes MPC/IK convergence metrics and lift success
+- Identifies common failure modes automatically
 
 ---
 
