@@ -5,289 +5,127 @@ Position-space MPC for position-controlled robots
 
 import numpy as np
 import casadi as ca
+import mujoco
 from pathlib import Path
 
 
 class MPCController:
-    """MPC controller for position-controlled robotic arm with NN-based obstacle avoidance."""
+    """MPC controller for position-controlled robotic arm with optional NN-based obstacle avoidance."""
 
-    def __init__(self, n_joints=6, horizon=30, dt=0.01, nn_fk_weights_path=None):
+    def __init__(
+        self,
+        n_joints=6,
+        horizon=30,
+        dt=0.05,
+        nn_fk_weights_path=None,
+        enable_nn_fk=True,
+    ):
         """
         Initialize MPC controller.
 
         Args:
             n_joints: Number of robot joints
             horizon: Prediction horizon (time steps)
-            dt: Time step duration (seconds)
+            dt: Time step duration (seconds) - should match outer control loop period
             nn_fk_weights_path: Path to neural network FK weights (.npz file).
-                               If None, defaults to "data/models/ur5e_fk_nn.npz"
+                                If None, defaults to "data/models/ur5e_fk_nn.npz"
+            enable_nn_fk: Whether to use the NN FK inside the MPC cost for obstacle avoidance.
+                          If False, only heuristic / MuJoCo-based obstacle checking is used.
         """
         self.n_joints = n_joints
         self.horizon = horizon
         self.dt = dt
+        self.enable_nn_fk = enable_nn_fk
 
         # Cost function weights
         self.Q = np.eye(n_joints) * 500.0      # Position error weight
         self.R = np.eye(n_joints) * 0.1        # Control smoothness weight
         self.Q_terminal = np.eye(n_joints) * 1000.0
-        
-        # Obstacle avoidance weight
-        self.obstacle_weight = 1e4  # Penalty for being inside obstacle safety margin
+
+        # Obstacle avoidance weight (for soft penalties)
+        self.obstacle_weight = 1e4
 
         # Constraints
-        self.joint_limits = (np.array([-2*np.pi]*n_joints),
-                             np.array([ 2*np.pi]*n_joints))
-        self.max_velocity = 5.0  # rad/s
-        
-        # Obstacle avoidance
-        self.obstacles = []  # List of (position, size) tuples
-        self.safety_margin = 0.10  # meters - minimum clearance from obstacles
-        self.n_max_obstacles = 10  # Maximum number of obstacles
+        self.joint_limits = (np.array([-2 * np.pi] * n_joints),
+                             np.array([ 2 * np.pi] * n_joints))
+        self.max_velocity = 3.0  # rad/s
+
+        # Obstacle representation
+        self.obstacles = []  # list of (position, size) tuples
+        self.safety_margin = 0.12  # meters - conservative clearance
+        self.n_max_obstacles = 10
+
+        # Bodies along the arm to check for collision (initialized later)
+        self.link_body_ids = []
 
         # Neural network FK
         self.nn_fk_fun = None
         if nn_fk_weights_path is None:
-            # Default path
             nn_fk_weights_path = Path(__file__).parent.parent.parent / "data" / "models" / "ur5e_fk_nn.npz"
-        
+
         nn_fk_weights_path = Path(nn_fk_weights_path)
-        if nn_fk_weights_path.exists():
+        if nn_fk_weights_path.exists() and self.enable_nn_fk:
             from src.control.nn_fk_casadi import build_nn_fk_function
             self.nn_fk_fun = build_nn_fk_function(str(nn_fk_weights_path), n_joints)
-            print(f"✓ Loaded NN FK from {nn_fk_weights_path}")
+            print(f"✓ Loaded NN FK from {nn_fk_weights_path} (enabled in MPC cost)")
+        elif nn_fk_weights_path.exists():
+            print(f"✓ NN FK weights found at {nn_fk_weights_path}, "
+                  f"but NN-based MPC cost is disabled (enable_nn_fk=False).")
         else:
             print(f"⚠ NN FK weights not found at {nn_fk_weights_path}")
-            print(f"  Obstacle avoidance will use heuristic-only approach.")
+            print(f"  Obstacle avoidance will use heuristic / MuJoCo-based checking only.")
             print(f"  To enable NN-based avoidance, run:")
             print(f"    1. python scripts/generate_fk_dataset.py")
             print(f"    2. python scripts/train_nn_fk.py")
 
         # Solver
         self.solver = None
+        self.prev_solution = None
         self.setup_optimization()
 
-    def setup_optimization(self):
-        """Set up MPC optimization for position-controlled robot with NN FK obstacle avoidance."""
+    # ------------------------------------------------------------------
+    # Public configuration helpers
+    # ------------------------------------------------------------------
 
-        n = self.n_joints
-        H = self.horizon
-
-        # Decision variables: desired positions at each time step
-        q = ca.SX.sym('q', n, H + 1)
-
-        # Parameters
-        q_current = ca.SX.sym('q_current', n)  # Current position
-        q_target = ca.SX.sym('q_target', n)    # Target position
-        
-        # Obstacle parameters (position and size for each obstacle)
-        obs_pos = ca.SX.sym('obs_pos', 3, self.n_max_obstacles)  # 3D centers
-        obs_size = ca.SX.sym('obs_size', 3, self.n_max_obstacles)  # 3D half-extents
-        n_active_obs = ca.SX.sym('n_active_obs', 1)  # Number of active obstacles
-
-        # Cost function
-        cost = 0
-
-        # Running cost: position error + smoothness
-        for k in range(H):
-            q_error = q[:, k] - q_target
-            cost += ca.mtimes([q_error.T, self.Q, q_error])
-
-            if k > 0:
-                q_change = q[:, k] - q[:, k-1]
-                cost += ca.mtimes([q_change.T, self.R, q_change])
-
-        # Terminal cost
-        q_error_final = q[:, H] - q_target
-        cost += ca.mtimes([q_error_final.T, self.Q_terminal, q_error_final])
-
-        # ===================================================================
-        # NEURAL NETWORK BASED OBSTACLE AVOIDANCE
-        # ===================================================================
-        # If NN FK is available, add obstacle avoidance penalties to the cost
-        if self.nn_fk_fun is not None:
-            print("  Adding NN FK obstacle avoidance to MPC cost...")
-            
-            for k in range(H + 1):
-                # Compute EE position using neural network FK
-                ee_pos_k = self.nn_fk_fun(q[:, k])  # 3x1 vector
-                
-                # For each obstacle, penalize penetration into safety zone
-                for i in range(self.n_max_obstacles):
-                    center = obs_pos[:, i]      # 3x1
-                    half_size = obs_size[:, i]  # 3x1
-                    
-                    # Inflated box size (adds safety margin)
-                    inflated = half_size + self.safety_margin
-                    
-                    # Distance from EE to obstacle center
-                    diff = ee_pos_k - center  # 3x1
-                    
-                    # Compute signed distance to box surface
-                    # u[i] = |diff[i]| - inflated[i]
-                    # Negative means inside inflated box
-                    u = ca.fabs(diff) - inflated
-                    
-                    # Penetration vector (only negative components matter)
-                    # pen_vec[i] = min(0, u[i])
-                    pen_vec = ca.fmin(0, u)
-                    
-                    # Penetration magnitude (L2 norm of negative parts)
-                    pen_mag = ca.sqrt(ca.sumsqr(pen_vec))
-                    
-                    # Add quadratic penalty for penetration
-                    # This creates a strong repulsive force when inside safety zone
-                    cost += self.obstacle_weight * pen_mag**2
-        else:
-            print("  NN FK not available, using heuristic obstacle avoidance only")
-
-        # ===================================================================
-        # CONSTRAINTS
-        # ===================================================================
-        constraints = []
-        lbg = []
-        ubg = []
-
-        # Initial condition: start from current position
-        constraints.append(q[:, 0] - q_current)
-        lbg.extend([0] * n)
-        ubg.extend([0] * n)
-
-        # Velocity constraints
-        for k in range(H):
-            velocity = (q[:, k+1] - q[:, k]) / self.dt
-            for j in range(n):
-                constraints.append(velocity[j])
-                lbg.append(-self.max_velocity)
-                ubg.append(self.max_velocity)
-
-        # Variable bounds (position limits)
-        lbx = []
-        ubx = []
-        for _ in range(self.horizon + 1):
-            lbx.extend(self.joint_limits[0])
-            ubx.extend(self.joint_limits[1])
-
-        # Pack variables and parameters
-        opt_variables = ca.reshape(q, -1, 1)
-        opt_params = ca.vertcat(q_current, q_target, ca.reshape(obs_pos, -1, 1), 
-                                ca.reshape(obs_size, -1, 1), n_active_obs)
-
-        # Create NLP
-        nlp = {
-            'x': opt_variables,
-            'p': opt_params,
-            'f': cost,
-            'g': ca.vertcat(*constraints) if constraints else ca.SX.zeros(0, 1)
-        }
-
-        # Solver options (tuned for speed with NN FK)
-        opts = {
-            'ipopt.print_level': 0,
-            'ipopt.max_iter': 100,  # Reduced for speed
-            'print_time': 0,
-            'ipopt.tol': 1e-4,      # Relaxed tolerance
-            'ipopt.acceptable_tol': 1e-3,  # Relaxed acceptable tolerance
-            'ipopt.warm_start_init_point': 'yes',
-            'ipopt.mu_strategy': 'adaptive',  # Faster convergence
-        }
-
-        self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-        self.lbx = lbx
-        self.ubx = ubx
-        self.lbg = lbg
-        self.ubg = ubg
-
-        # Store for warm starting
-        self.prev_solution = None
-
-        print(f"✓ MPC initialized: {self.n_joints} joints, horizon={self.horizon}, dt={self.dt}")
-        print(f"  Position weight: {self.Q[0,0]}, Terminal weight: {self.Q_terminal[0,0]}")
-        if self.nn_fk_fun is not None:
-            print(f"  NN-based obstacle avoidance: max {self.n_max_obstacles} obstacles")
-            print(f"  Safety margin: {self.safety_margin}m, Penalty weight: {self.obstacle_weight}")
-        else:
-            print(f"  Heuristic obstacle avoidance: margin={self.safety_margin}m")
-
-    def compute_control(self, current_state, target_state, model=None, data_scratch=None, site_id=None):
+    def initialize_link_bodies(self, model):
         """
-        Compute optimal position command using MPC.
+        Initialize which robot bodies (links) are used for collision checks.
 
-        Args:
-            current_state: Current joint positions and velocities [q, dq] (12,)
-            target_state: Target joint positions (6,)
-            model: MuJoCo model (for FK and obstacle checking)
-            data_scratch: MuJoCo data scratch buffer (for FK)
-            site_id: End-effector site ID
+        We try a set of common UR5e link names with the "arm_" prefix that is
+        added in the demo when attaching the robot.
 
-        Returns:
-            optimal_position: Target position for next timestep (6,)
-            predicted_trajectory: Predicted trajectory over horizon
+        If no matches are found, collision checks fall back to EE-only.
         """
-        q_current = current_state[:self.n_joints]
-        q_target = target_state
+        if self.link_body_ids:
+            return  # already initialized
 
-        # Initial guess
-        if self.prev_solution is None:
-            x0 = np.zeros(self.n_joints * (self.horizon + 1))
-            for k in range(self.horizon + 1):
-                alpha = k / self.horizon
-                x0[k*self.n_joints:(k+1)*self.n_joints] = (1-alpha)*q_current + alpha*q_target
+        candidate_names = [
+            # Common UR5e link names with "arm_" prefix
+            "arm_base_link",
+            "arm_shoulder_link",
+            "arm_upper_arm_link",
+            "arm_forearm_link",
+            "arm_wrist_1_link",
+            "arm_wrist_2_link",
+            "arm_wrist_3_link",
+            # Some gripper / tool bodies that might exist
+            "arm_tool0",
+            "arm_hand_base",
+        ]
+
+        for name in candidate_names:
+            try:
+                bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+                if bid >= 0:
+                    self.link_body_ids.append(bid)
+            except Exception:
+                continue
+
+        if self.link_body_ids:
+            print(f"✓ MPC collision checks will use {len(self.link_body_ids)} arm link bodies.")
         else:
-            # Warm start: shift previous solution
-            x0 = np.zeros(self.n_joints * (self.horizon + 1))
-            x0[:self.n_joints*self.horizon] = self.prev_solution[self.n_joints:]
-            x0[self.n_joints*self.horizon:] = self.prev_solution[-self.n_joints:]
-
-        # Prepare obstacle parameters
-        obs_pos_flat = np.zeros(3 * self.n_max_obstacles)
-        obs_size_flat = np.zeros(3 * self.n_max_obstacles)
-        n_active = min(len(self.obstacles), self.n_max_obstacles)
-        
-        for i, (pos, size) in enumerate(self.obstacles[:self.n_max_obstacles]):
-            obs_pos_flat[i*3:(i+1)*3] = pos
-            obs_size_flat[i*3:(i+1)*3] = size
-
-        # Parameters
-        params = np.concatenate([q_current, q_target, obs_pos_flat, obs_size_flat, [n_active]])
-
-        # Solve with obstacle-aware constraints
-        try:
-            # Check if current trajectory would collide with obstacles
-            if model is not None and data_scratch is not None and site_id is not None:
-                # Penalize trajectories that get too close to obstacles
-                collision_detected = self._check_trajectory_collision(
-                    x0.reshape(self.horizon + 1, self.n_joints),
-                    model, data_scratch, site_id
-                )
-                if collision_detected:
-                    # Modify initial guess to go around obstacles
-                    x0 = self._generate_collision_free_guess(q_current, q_target, model, data_scratch, site_id)
-            
-            sol = self.solver(
-                x0=x0,
-                lbx=self.lbx,
-                ubx=self.ubx,
-                lbg=self.lbg,
-                ubg=self.ubg,
-                p=params
-            )
-
-            # Extract solution
-            x_opt = sol['x'].full().flatten()
-            self.prev_solution = x_opt.copy()  # Save for warm start
-
-            # Extract trajectory
-            q_opt = x_opt.reshape(self.horizon + 1, self.n_joints)
-
-            # Return next desired position
-            return q_opt[1], q_opt
-            
-        except Exception as e:
-            print(f"MPC solve failed: {e}, using fallback")
-            # Return a safe fallback (small step toward target)
-            alpha = 0.05
-            q_next = (1 - alpha) * q_current + alpha * q_target
-            return q_next, np.tile(q_next, (self.horizon + 1, 1))
+            print("⚠ MPC collision checks: no arm link bodies found by name; "
+                  "falling back to EE-only distance checks.")
 
     def set_cost_weights(self, Q, Q_terminal, R):
         """Set cost function weights and rebuild solver."""
@@ -312,7 +150,7 @@ class MPCController:
     def add_obstacle(self, position, size):
         """
         Add an obstacle for avoidance.
-        
+
         Args:
             position: 3D position [x, y, z] of obstacle center
             size: 3D size [sx, sy, sz] of obstacle (half-extents for box)
@@ -325,138 +163,326 @@ class MPCController:
         self.obstacles = []
         print("Cleared all obstacles")
 
+    # ------------------------------------------------------------------
+    # Optimization problem
+    # ------------------------------------------------------------------
+
+    def setup_optimization(self):
+        """Set up MPC optimization for position-controlled robot."""
+        n = self.n_joints
+        H = self.horizon
+
+        # Decision variables: joint positions over the horizon
+        q = ca.SX.sym('q', n, H + 1)
+
+        # Parameters
+        q_current = ca.SX.sym('q_current', n)  # current joint position
+        q_target = ca.SX.sym('q_target', n)    # target joint position
+
+        # Obstacle parameters
+        obs_pos = ca.SX.sym('obs_pos', 3, self.n_max_obstacles)   # centers
+        obs_size = ca.SX.sym('obs_size', 3, self.n_max_obstacles) # half-extents
+        n_active_obs = ca.SX.sym('n_active_obs', 1)               # number of obstacles
+
+        # Cost function
+        cost = 0
+
+        # Running cost: tracking + smoothness
+        for k in range(H):
+            q_error = q[:, k] - q_target
+            cost += ca.mtimes([q_error.T, self.Q, q_error])
+
+            if k > 0:
+                q_change = q[:, k] - q[:, k - 1]
+                cost += ca.mtimes([q_change.T, self.R, q_change])
+
+        # Terminal cost
+        q_error_final = q[:, H] - q_target
+        cost += ca.mtimes([q_error_final.T, self.Q_terminal, q_error_final])
+
+        # NN FK-based obstacle penalty (optional)
+        if self.nn_fk_fun is not None and self.enable_nn_fk:
+            print("  Adding NN FK obstacle avoidance to MPC cost...")
+            for k in range(H + 1):
+                ee_pos_k = self.nn_fk_fun(q[:, k])  # 3x1
+
+                for i in range(self.n_max_obstacles):
+                    center = obs_pos[:, i]
+                    half_size = obs_size[:, i]
+
+                    inflated = half_size + self.safety_margin
+                    diff = ee_pos_k - center
+                    u = ca.fabs(diff) - inflated       # negative inside inflated box
+                    pen_vec = ca.fmin(0, u)            # only negative parts
+                    pen_mag = ca.sqrt(ca.sumsqr(pen_vec))
+
+                    active_mask = ca.if_else(i < n_active_obs, 1.0, 0.0)
+                    cost += active_mask * self.obstacle_weight * pen_mag ** 2
+        else:
+            print("  NN FK is not used in MPC cost; heuristic / MuJoCo checks only.")
+
+        # Constraints
+        constraints = []
+        lbg = []
+        ubg = []
+
+        # Initial condition: q[0] = q_current
+        constraints.append(q[:, 0] - q_current)
+        lbg.extend([0] * n)
+        ubg.extend([0] * n)
+
+        # Velocity constraints
+        for k in range(H):
+            velocity = (q[:, k + 1] - q[:, k]) / self.dt
+            for j in range(n):
+                constraints.append(velocity[j])
+                lbg.append(-self.max_velocity)
+                ubg.append(self.max_velocity)
+
+        # Variable bounds (joint limits)
+        lbx = []
+        ubx = []
+        for _ in range(H + 1):
+            lbx.extend(self.joint_limits[0])
+            ubx.extend(self.joint_limits[1])
+
+        # Pack variables and parameters
+        opt_variables = ca.reshape(q, -1, 1)
+        opt_params = ca.vertcat(
+            q_current,
+            q_target,
+            ca.reshape(obs_pos, -1, 1),
+            ca.reshape(obs_size, -1, 1),
+            n_active_obs,
+        )
+
+        # Create NLP
+        nlp = {
+            'x': opt_variables,
+            'p': opt_params,
+            'f': cost,
+            'g': ca.vertcat(*constraints) if constraints else ca.SX.zeros(0, 1),
+        }
+
+        opts = {
+            'ipopt.print_level': 0,
+            'ipopt.max_iter': 100,
+            'print_time': 0,
+            'ipopt.tol': 1e-4,
+            'ipopt.acceptable_tol': 1e-3,
+            'ipopt.warm_start_init_point': 'yes',
+            'ipopt.mu_strategy': 'adaptive',
+        }
+
+        self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
+        self.lbx = lbx
+        self.ubx = ubx
+        self.lbg = lbg
+        self.ubg = ubg
+        self.prev_solution = None
+
+        print(f"✓ MPC initialized: {self.n_joints} joints, horizon={self.horizon}, dt={self.dt}")
+        if self.nn_fk_fun is not None and self.enable_nn_fk:
+            print(f"  NN-based obstacle avoidance: max {self.n_max_obstacles} obstacles")
+            print(f"  Safety margin: {self.safety_margin}m, Penalty weight: {self.obstacle_weight}")
+        else:
+            print(f"  Heuristic / MuJoCo obstacle avoidance: margin={self.safety_margin}m")
+
+    # ------------------------------------------------------------------
+    # MPC solve
+    # ------------------------------------------------------------------
+
+    def compute_control(self, current_state, target_state, model=None, data_scratch=None, site_id=None):
+        """
+        Compute optimal position command using MPC.
+
+        Args:
+            current_state: Current [q, dq] (2 * n_joints,)
+            target_state: Target joint positions (n_joints,)
+            model: MuJoCo model (for FK / collision checking)
+            data_scratch: MuJoCo data scratch buffer (for FK)
+            site_id: End-effector site ID (for EE collision checking)
+
+        Returns:
+            q_next: Target position for next timestep (n_joints,)
+            q_traj: Predicted trajectory over horizon (H+1, n_joints)
+        """
+        q_current = current_state[:self.n_joints]
+        q_target = target_state
+
+        # Initial guess
+        if self.prev_solution is None:
+            x0 = np.zeros(self.n_joints * (self.horizon + 1))
+            for k in range(self.horizon + 1):
+                alpha = k / self.horizon
+                x0[k * self.n_joints:(k + 1) * self.n_joints] = (1 - alpha) * q_current + alpha * q_target
+        else:
+            x0 = np.zeros(self.n_joints * (self.horizon + 1))
+            x0[:self.n_joints * self.horizon] = self.prev_solution[self.n_joints:]
+            x0[self.n_joints * self.horizon:] = self.prev_solution[-self.n_joints:]
+
+        # Prepare obstacle parameters
+        obs_pos_flat = np.zeros(3 * self.n_max_obstacles)
+        obs_size_flat = np.zeros(3 * self.n_max_obstacles)
+        n_active = min(len(self.obstacles), self.n_max_obstacles)
+
+        for i, (pos, size) in enumerate(self.obstacles[:self.n_max_obstacles]):
+            obs_pos_flat[i * 3:(i + 1) * 3] = pos
+            obs_size_flat[i * 3:(i + 1) * 3] = size
+
+        params = np.concatenate([q_current, q_target, obs_pos_flat, obs_size_flat, [n_active]])
+
+        try:
+            # Use MuJoCo-based geometric check to adjust initial guess if needed
+            if (
+                model is not None
+                and data_scratch is not None
+                and (site_id is not None or self.link_body_ids)
+            ):
+                collision_detected = self._check_trajectory_collision(
+                    x0.reshape(self.horizon + 1, self.n_joints),
+                    model,
+                    data_scratch,
+                    site_id,
+                )
+                if collision_detected:
+                    x0 = self._generate_collision_free_guess(q_current, q_target, model, data_scratch, site_id)
+
+            sol = self.solver(
+                x0=x0,
+                lbx=self.lbx,
+                ubx=self.ubx,
+                lbg=self.lbg,
+                ubg=self.ubg,
+                p=params,
+            )
+
+            x_opt = sol['x'].full().flatten()
+            self.prev_solution = x_opt.copy()
+
+            q_opt = x_opt.reshape(self.horizon + 1, self.n_joints)
+            return q_opt[1], q_opt
+
+        except Exception as e:
+            print(f"MPC solve failed: {e}, using fallback step toward target")
+            alpha = 0.05
+            q_next = (1 - alpha) * q_current + alpha * q_target
+            return q_next, np.tile(q_next, (self.horizon + 1, 1))
+
+    # ------------------------------------------------------------------
+    # Collision checking helpers
+    # ------------------------------------------------------------------
+
     def _check_trajectory_collision(self, trajectory, model, data_scratch, site_id):
         """
         Check if a trajectory collides with any obstacles.
-        
+
         Args:
-            trajectory: Array of joint positions (horizon+1, n_joints)
+            trajectory: (H+1, n_joints) array of joint angles
             model: MuJoCo model
-            data_scratch: MuJoCo data for FK computation
-            site_id: End-effector site ID
-            
+            data_scratch: MuJoCo data for FK
+            site_id: EE site ID (may be None)
+
         Returns:
-            True if collision detected, False otherwise
+            True if collision detected, False otherwise.
         """
         if not self.obstacles:
             return False
-            
-        # Sample every few steps in trajectory
-        for k in range(0, len(trajectory), max(1, len(trajectory) // 5)):
-            # Compute FK for this configuration
+
+        step_stride = max(1, len(trajectory) // 5)
+        for k in range(0, len(trajectory), step_stride):
             data_scratch.qpos[:self.n_joints] = trajectory[k]
-            import mujoco
             mujoco.mj_kinematics(model, data_scratch)
-            ee_pos = data_scratch.site_xpos[site_id].copy()
-            
-            # Check against all obstacles
-            for obs_pos, obs_size in self.obstacles:
-                if self._point_box_distance(ee_pos, obs_pos, obs_size) < self.safety_margin:
-                    return True
+
+            # Points to check: EE + selected arm link bodies
+            points = []
+
+            if site_id is not None:
+                points.append(data_scratch.site_xpos[site_id].copy())
+
+            for bid in self.link_body_ids:
+                points.append(data_scratch.xpos[bid].copy())
+
+            if not points and site_id is None:
+                # No points defined, cannot check
+                continue
+
+            for p in points:
+                for obs_pos, obs_size in self.obstacles:
+                    dist = self._point_box_distance(p, obs_pos, obs_size)
+                    if dist < self.safety_margin:
+                        return True
+
         return False
 
-    def _point_box_distance(self, point, box_center, box_size):
+    @staticmethod
+    def _point_box_distance(point, box_center, box_size):
         """
-        Compute minimum distance from point to box surface.
-        
+        Compute minimum distance from point to axis-aligned box surface.
+
         Args:
             point: 3D point
-            box_center: 3D box center
-            box_size: 3D box half-extents
-            
+            box_center: 3D center
+            box_size: 3D half-extents
+
         Returns:
-            Minimum distance (negative if inside box)
+            Signed distance: negative if inside box, positive outside.
         """
-        # Vector from box center to point
         diff = point - box_center
-        
-        # Clamp to box surface
         clamped = np.clip(diff, -box_size, box_size)
-        
-        # Distance from point to nearest point on box surface
+
         if np.allclose(diff, clamped):
-            # Point is inside box - return negative distance to surface
+            # Inside box: negative distance to nearest face
             distances = box_size - np.abs(diff)
             return -np.min(distances)
         else:
-            # Point is outside - return distance to surface
+            # Outside: distance to nearest point on surface
             return np.linalg.norm(diff - clamped)
 
     def _generate_collision_free_guess(self, q_start, q_goal, model, data_scratch, site_id):
         """
-        Generate initial guess that attempts to avoid obstacles.
-        Uses multiple strategies to find collision-free path.
-        
+        Generate initial guess trajectory that attempts to avoid obstacles
+        by moving high over the workspace and then to the goal.
+
         Args:
-            q_start: Starting joint configuration
-            q_goal: Goal joint configuration
-            model: MuJoCo model
-            data_scratch: MuJoCo data for FK
-            site_id: End-effector site ID
-            
+            q_start: starting joint configuration
+            q_goal: goal joint configuration
+            model, data_scratch, site_id: MuJoCo structures (not heavily used here)
+
         Returns:
-            Initial guess trajectory
+            x0: flattened trajectory (n_joints * (H+1),)
         """
-        import mujoco
-        
-        # Compute start and goal EE positions
-        data_scratch.qpos[:self.n_joints] = q_start
-        mujoco.mj_kinematics(model, data_scratch)
-        start_ee = data_scratch.site_xpos[site_id].copy()
-        
-        data_scratch.qpos[:self.n_joints] = q_goal
-        mujoco.mj_kinematics(model, data_scratch)
-        goal_ee = data_scratch.site_xpos[site_id].copy()
-        
-        # Find obstacle center(s) to determine best avoidance strategy
+        H = self.horizon
+        n = self.n_joints
+
         if self.obstacles:
-            # Compute average obstacle position
-            obs_center = np.mean([pos for pos, _ in self.obstacles], axis=0)
-            
-            # Determine if we should go over, under, or around
-            # Check if obstacles are more vertical (wall) or horizontal (ceiling)
-            max_obs_height = max(pos[2] + size[2] for pos, size in self.obstacles)
-            
-            # Strategy: Go high over obstacles
-            waypoint = q_start.copy()
-            
-            # UR5e joint indices (typical):
-            # 0: shoulder_pan, 1: shoulder_lift, 2: elbow, 3: wrist_1, 4: wrist_2, 5: wrist_3
-            
-            # Adjust shoulder and elbow to create high arc
-            waypoint[1] -= 0.8  # Shoulder lift - move up (negative is up for UR5e)
-            waypoint[2] -= 0.5  # Elbow - extend upward
-            
-            # Create two-waypoint trajectory for smoother motion
+            # "Go high" strategy in joint space (UR5e-ish)
+            waypoint1 = q_start.copy()
+            waypoint1[1] -= 0.8  # shoulder lift up
+            waypoint1[2] -= 0.5  # elbow up / extend
+
             waypoint2 = q_goal.copy()
-            waypoint2[1] -= 0.4  # Partial lift on approach to goal
-            
-            x0 = np.zeros(self.n_joints * (self.horizon + 1))
-            
-            # Build trajectory: start -> waypoint1 -> waypoint2 -> goal
-            for k in range(self.horizon + 1):
-                t = k / self.horizon
+            waypoint2[1] -= 0.4  # still somewhat lifted near goal
+
+            x0 = np.zeros(n * (H + 1))
+            for k in range(H + 1):
+                t = k / H
                 if t < 0.33:
-                    # First third: start to waypoint1
                     alpha = t / 0.33
-                    q_k = (1 - alpha) * q_start + alpha * waypoint
+                    q_k = (1 - alpha) * q_start + alpha * waypoint1
                 elif t < 0.67:
-                    # Second third: waypoint1 to waypoint2
                     alpha = (t - 0.33) / 0.34
-                    q_k = (1 - alpha) * waypoint + alpha * waypoint2
+                    q_k = (1 - alpha) * waypoint1 + alpha * waypoint2
                 else:
-                    # Final third: waypoint2 to goal
                     alpha = (t - 0.67) / 0.33
                     q_k = (1 - alpha) * waypoint2 + alpha * q_goal
-                
-                x0[k*self.n_joints:(k+1)*self.n_joints] = q_k
-                
+                x0[k * n:(k + 1) * n] = q_k
         else:
-            # No obstacles, use direct interpolation
-            x0 = np.zeros(self.n_joints * (self.horizon + 1))
-            for k in range(self.horizon + 1):
-                alpha = k / self.horizon
+            # Simple linear interpolation
+            x0 = np.zeros(n * (H + 1))
+            for k in range(H + 1):
+                alpha = k / H
                 q_k = (1 - alpha) * q_start + alpha * q_goal
-                x0[k*self.n_joints:(k+1)*self.n_joints] = q_k
-        
+                x0[k * n:(k + 1) * n] = q_k
+
         return x0

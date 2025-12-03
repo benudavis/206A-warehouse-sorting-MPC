@@ -25,26 +25,31 @@ camera:
 
 # MPC Parameters
 mpc:
-  horizon: 20
-  dt: 0.01  # Time step in seconds
+  horizon: 10  # Prediction horizon (steps)
+  dt: 0.05  # Time step in seconds (must match control loop: 250 * 0.0002s = 0.05s)
   max_iterations: 100
   convergence_threshold: 1e-4
   
   # Cost weights
   weights:
-    position_error: 10.0
-    velocity: 0.1
-    control_effort: 0.01
+    position_error: 500.0  # Q - Position tracking weight
+    terminal_error: 1000.0  # Q_terminal - Final state weight
+    control_smoothness: 0.1  # R - Control effort weight
+    obstacle_penalty: 10000.0  # Penalty for being inside obstacle safety margin
   
   # Constraints
   joint_limits:
     lower: [-6.28, -6.28, -6.28, -6.28, -6.28, -6.28]
     upper: [6.28, 6.28, 6.28, 6.28, 6.28, 6.28]
-  velocity_limits: 2.0  # rad/s
-  acceleration_limits: 5.0  # rad/s^2
+  max_velocity: 3.0  # rad/s (tuned for smooth motion)
   
   # Collision avoidance
-  min_obstacle_distance: 0.05  # meters
+  safety_margin: 0.05  # meters - minimum clearance from obstacles (5cm)
+  object_clearance: 0.03  # meters - extra margin when holding objects (+3cm = 8cm total)
+  
+  # Trajectory execution
+  replan_interval: 8  # Re-run MPC every N steps (8 steps with horizon 10)
+  smoothing_factor: 0.2  # Blend factor for trajectory smoothing (0.0-1.0)
 
 # Object Detection
 detection:
