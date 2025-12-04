@@ -25,10 +25,11 @@ camera:
 
 # MPC Parameters
 mpc:
-  horizon: 10  # Prediction horizon (steps)
+  horizon: 5  # Prediction horizon (steps) - 10 * 0.05s = 0.5s lookahead
   dt: 0.05  # Time step in seconds (must match control loop: 250 * 0.0002s = 0.05s)
-  max_iterations: 100
-  convergence_threshold: 1e-4
+  max_iterations: 3  # Aggressive limit for real-time performance
+  convergence_threshold: 5e-3  # Relaxed for speed
+  execution_mode: "receding_horizon"  # Solve MPC at EVERY control step
   
   # Cost weights
   weights:
@@ -43,13 +44,16 @@ mpc:
     upper: [6.28, 6.28, 6.28, 6.28, 6.28, 6.28]
   max_velocity: 3.0  # rad/s (tuned for smooth motion)
   
-  # Collision avoidance
+  # Collision avoidance (multi-link protection)
   safety_margin: 0.05  # meters - minimum clearance from obstacles (5cm)
   object_clearance: 0.03  # meters - extra margin when holding objects (+3cm = 8cm total)
+  collision_check_points: 4  # Number of arm points checked (shoulder, elbow, wrist, EE)
+  constraint_type: "hard"  # Hard constraint: cannot penetrate obstacles
+  margin_type: "soft_cost"  # Soft penalty for safety margin violations
   
   # Trajectory execution
-  replan_interval: 8  # Re-run MPC every N steps (8 steps with horizon 10)
-  smoothing_factor: 0.2  # Blend factor for trajectory smoothing (0.0-1.0)
+  # True receding horizon: MPC solved every control step
+  # Applies only first command, then replans from new state
 
 # Object Detection
 detection:

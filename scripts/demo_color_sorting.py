@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Color-based warehouse sorting demo with obstacle avoidance."""
+"""
+Color-based warehouse sorting demo with MPC obstacle avoidance.
+
+Goal:
+  - Pick boxes from the central region,
+  - Route them around a vertical wall,
+  - Place them into left/right baskets based on color,
+  - Avoid collisions with the wall as much as possible.
+"""
 
 import argparse
 import sys
@@ -15,7 +23,9 @@ try:
 except Exception:
     HAS_VIEWER = False
 
+# Make sure repo root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from src.control.inverse_kinematics import IKSolver
 from src.control.mpc_controller import MPCController
 from src.diagnostics import DiagnosticLogger
@@ -23,36 +33,35 @@ from src.diagnostics import DiagnosticLogger
 EE_SITE = "arm_hand_pinch"
 MODELS_DIR = Path(__file__).parent.parent / "sim" / "models"
 
-# Safety margin constants (meters) - used by MPC and visualization
-BASE_SAFETY_MARGIN = 0.05   # 5cm clearance when robot is empty
-OBJECT_SAFETY_MARGIN = 0.08  # 8cm clearance when robot holds an object
+# Safety margins [m]
+BASE_SAFETY_MARGIN = 0.05   # robot empty-handed
+OBJECT_SAFETY_MARGIN = 0.08  # robot holding a box
 
-# Box configurations: All boxes start in the middle, easily reachable
-# Red boxes go to left basket, Blue boxes go to right basket
+# Box configurations
 BOXES = [
-    # Red boxes (go to left basket)
+    # Red boxes → red basket
     {"name": "red_1",  "pos": [0.35, -0.28, 0.52], "size": 0.030, "rgba": [0.9, 0.1, 0.1, 1.0], "color": "red"},
     {"name": "red_2",  "pos": [0.40, -0.32, 0.52], "size": 0.028, "rgba": [0.8, 0.0, 0.0, 1.0], "color": "red"},
     {"name": "red_3",  "pos": [0.45, -0.28, 0.52], "size": 0.032, "rgba": [1.0, 0.2, 0.2, 1.0], "color": "red"},
-    # Blue boxes (go to right basket)
+    # Blue boxes → blue basket
     {"name": "blue_1", "pos": [0.35, -0.42, 0.52], "size": 0.030, "rgba": [0.1, 0.1, 0.9, 1.0], "color": "blue"},
     {"name": "blue_2", "pos": [0.40, -0.38, 0.52], "size": 0.028, "rgba": [0.0, 0.0, 0.8, 1.0], "color": "blue"},
     {"name": "blue_3", "pos": [0.45, -0.42, 0.52], "size": 0.032, "rgba": [0.2, 0.2, 1.0, 1.0], "color": "blue"},
 ]
 
-# Basket positions: left side, further from boxes
+# Basket positions (left side)
 BASKETS = {
-    "red":  {"pos": [-0.45, -0.10, 0.48], "rgba": [0.8, 0.2, 0.2, 0.5]},   # Left side for red
-    "blue": {"pos": [-0.45, -0.60, 0.48], "rgba": [0.2, 0.2, 0.8, 0.5]},   # Left side for blue
+    "red":  {"pos": [-0.45, -0.10, 0.48], "rgba": [0.8, 0.2, 0.2, 0.5]},
+    "blue": {"pos": [-0.45, -0.60, 0.48], "rgba": [0.2, 0.2, 0.8, 0.5]},
 }
 
+# ----------------------------------------------------------------------
+# Quaternion helpers
+# ----------------------------------------------------------------------
 
-# -----------------------------
-# Quaternion helper functions
-# -----------------------------
 
 def quat_mul(q1, q2):
-    """Multiply two quaternions (w, x, y, z) in MuJoCo convention."""
+    """Multiply two quaternions (w, x, y, z), MuJoCo convention."""
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
     return np.array(
@@ -73,6 +82,8 @@ def quat_conj(q):
 
 
 class FullscreenEnforcer:
+    """Helper to force fullscreen viewer a few times after launch."""
+
     def __init__(self, viewer, retries=30, interval=0.1):
         self.viewer = viewer
         self.retries = max(1, retries)
@@ -105,486 +116,220 @@ class FullscreenEnforcer:
 def parse_args():
     parser = argparse.ArgumentParser(description="Color-based warehouse sorting demo")
     parser.add_argument("--headless", action="store_true", help="Run without viewer")
-    parser.add_argument("--diagnostics", action="store_true", help="Record diagnostics")
-    parser.add_argument("--diag-dir", default="data/diagnostics", help="Diagnostics output directory")
-    parser.add_argument("--diag-interval", type=int, default=20, help="Log diagnostics every N steps")
+    parser.add_argument(
+        "--diagnostics", action="store_true", help="Record diagnostics logs"
+    )
+    parser.add_argument(
+        "--diag-dir", default="data/diagnostics", help="Diagnostics output directory"
+    )
+    parser.add_argument(
+        "--diag-interval", type=int, default=20, help="Log diagnostics every N steps"
+    )
     return parser.parse_args()
 
 
-def build_world():
-    """Build world with boxes, baskets, and obstacles."""
-    scene = mujoco.MjSpec.from_file(str(MODELS_DIR / "scene.xml"))
-    arm_spec = mujoco.MjSpec.from_file(str(MODELS_DIR / "universal_robots_ur5e" / "ur5e.xml"))
-    hand_spec = mujoco.MjSpec.from_file(str(MODELS_DIR / "robotiq_2f85" / "2f85.xml"))
+# ----------------------------------------------------------------------
+# World construction
+# ----------------------------------------------------------------------
 
+
+def build_world():
+    """Build world with boxes, baskets, and a central obstacle wall."""
+    scene = mujoco.MjSpec.from_file(str(MODELS_DIR / "scene.xml"))
+    arm_spec = mujoco.MjSpec.from_file(
+        str(MODELS_DIR / "universal_robots_ur5e" / "ur5e.xml")
+    )
+    hand_spec = mujoco.MjSpec.from_file(
+        str(MODELS_DIR / "robotiq_2f85" / "2f85.xml")
+    )
+
+    # Attach hand to robot, robot to scene
     arm_spec.site("attachment_site").attach_body(hand_spec.worldbody, "hand_", "")
     scene.site("robot_site").attach_body(arm_spec.worldbody, "arm_", "")
 
-    # Create baskets (bins)
-    for basket_name, basket_config in BASKETS.items():
+    # Baskets and their safety visualization
+    for basket_name, cfg in BASKETS.items():
+        # Actual basket
         basket = scene.worldbody.add_body()
         basket.name = f"basket_{basket_name}"
-        basket.pos = basket_config["pos"]
+        basket.pos = cfg["pos"]
         basket_geom = basket.add_geom()
         basket_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-        basket_geom.size = [0.15, 0.15, 0.02]
-        basket_geom.rgba = basket_config["rgba"]
+        basket_size = [0.15, 0.15, 0.02]
+        basket_geom.size = basket_size
+        basket_geom.rgba = cfg["rgba"]
 
-    # Vertical wall obstacle between boxes and baskets (moved further from boxes)
+        # Safety visualization only (no collisions)
+        basket_safety = scene.worldbody.add_body()
+        basket_safety.name = f"basket_{basket_name}_safety"
+        basket_safety.pos = cfg["pos"]
+        basket_safety_geom = basket_safety.add_geom()
+        basket_safety_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+        basket_safety_geom.size = [
+            basket_size[0] + BASE_SAFETY_MARGIN,
+            basket_size[1] + BASE_SAFETY_MARGIN,
+            basket_size[2] + BASE_SAFETY_MARGIN,
+        ]
+        basket_safety_geom.rgba = [0.5, 0.5, 0.5, 0.15]
+        basket_safety_geom.contype = 0
+        basket_safety_geom.conaffinity = 0
+
+    # Center wall obstacle
     obstacle = scene.worldbody.add_body()
     obstacle.name = "obstacle_center_wall"
-    obstacle.pos = [-0.15, -0.35, 0.70]  # Wall positioned between boxes and baskets
+    obstacle.pos = [-0.15, -0.35, 0.70]
     obs_geom = obstacle.add_geom()
     obs_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-    obs_geom.size = [0.01, 0.12, 0.08]  # Actual obstacle: 2cm thick, 24cm wide, 16cm tall
-    obs_geom.rgba = [0.9, 0.5, 0.1, 0.85]  # Orange, semi-transparent
-    
-    # Visualize safety margins (MPC keeps robot these distances away)
-    # 
-    # Layered Safety Zones:
-    #   [Orange Box]  = Actual obstacle (2cm × 24cm × 16cm)
-    #   [Red Zone]    = +5cm margin all around (robot empty-handed)
-    #   [Yellow Zone] = +8cm margin all around (robot holding object)
-    #
-    # MPC Cost Function: Penalty increases as robot enters these zones
-    #
+    obs_geom.size = [0.01, 0.12, 0.08]  # thin wall
+    obs_geom.rgba = [0.9, 0.5, 0.1, 0.85]
+
+    # Safety margin visualizations for wall
     safety_viz = scene.worldbody.add_body()
     safety_viz.name = "obstacle_safety_margin"
-    safety_viz.pos = [-0.15, -0.35, 0.70]  # Same center as obstacle
+    safety_viz.pos = [-0.15, -0.35, 0.70]
     safety_margin_geom = safety_viz.add_geom()
     safety_margin_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-    # Add base safety margin to each dimension
-    safety_margin_geom.size = [0.01 + BASE_SAFETY_MARGIN, 0.12 + BASE_SAFETY_MARGIN, 0.08 + BASE_SAFETY_MARGIN]
-    safety_margin_geom.rgba = [1.0, 0.0, 0.0, 0.2]  # Red, semi-transparent
-    safety_margin_geom.contype = 0  # No collision
+    safety_margin_geom.size = [
+        0.01 + BASE_SAFETY_MARGIN,
+        0.12 + BASE_SAFETY_MARGIN,
+        0.08 + BASE_SAFETY_MARGIN,
+    ]
+    safety_margin_geom.rgba = [1.0, 0.0, 0.0, 0.2]
+    safety_margin_geom.contype = 0
     safety_margin_geom.conaffinity = 0
-    
-    # Visualize extended margin when holding objects
+
     holding_margin_viz = scene.worldbody.add_body()
     holding_margin_viz.name = "obstacle_holding_margin"
-    holding_margin_viz.pos = [-0.15, -0.35, 0.70]  # Same center
+    holding_margin_viz.pos = [-0.15, -0.35, 0.70]
     holding_margin_geom = holding_margin_viz.add_geom()
     holding_margin_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-    # Add object safety margin when holding objects
-    holding_margin_geom.size = [0.01 + OBJECT_SAFETY_MARGIN, 0.12 + OBJECT_SAFETY_MARGIN, 0.08 + OBJECT_SAFETY_MARGIN]
-    holding_margin_geom.rgba = [1.0, 1.0, 0.0, 0.12]  # Yellow, very transparent
-    holding_margin_geom.contype = 0  # No collision
+    holding_margin_geom.size = [
+        0.01 + OBJECT_SAFETY_MARGIN,
+        0.12 + OBJECT_SAFETY_MARGIN,
+        0.08 + OBJECT_SAFETY_MARGIN,
+    ]
+    holding_margin_geom.rgba = [1.0, 1.0, 0.0, 0.12]
+    holding_margin_geom.contype = 0
     holding_margin_geom.conaffinity = 0
 
     # Boxes
-    for box_config in BOXES:
+    for cfg in BOXES:
         box = scene.worldbody.add_body()
-        box.name = box_config["name"]
-        box.pos = box_config["pos"]
+        box.name = cfg["name"]
+        box.pos = cfg["pos"]
         geom = box.add_geom()
         geom.type = mujoco.mjtGeom.mjGEOM_BOX
-        geom.size = [box_config["size"]] * 3
-        geom.rgba = box_config["rgba"]
+        geom.size = [cfg["size"]] * 3
+        geom.rgba = cfg["rgba"]
         geom.mass = 0.05
-        geom.friction = [2.0, 0.01, 0.0005]  # Higher friction for stable grasping
+        geom.friction = [2.0, 0.01, 0.0005]
         box.add_freejoint()
 
-    # Pre-allocate trajectory visualization geoms
-    # For each joint in the arm (6 joints), create visualization markers
-    MAX_TRAJ_WAYPOINTS = 12  # Show up to 12 waypoints along trajectory
-    JOINT_NAMES = [
-        "arm_shoulder_pan_joint",
-        "arm_shoulder_lift_joint", 
-        "arm_elbow_joint",
-        "arm_wrist_1_joint",
-        "arm_wrist_2_joint",
-        "arm_wrist_3_joint"
-    ]
-    
-    # Colors for each joint (rainbow gradient)
+    # Pre-allocated trajectory visualization geoms
+    MAX_TRAJ_WAYPOINTS = 12
     JOINT_COLORS = [
-        [1.0, 0.0, 0.0, 0.7],  # Red - shoulder pan
-        [1.0, 0.5, 0.0, 0.7],  # Orange - shoulder lift
-        [1.0, 1.0, 0.0, 0.7],  # Yellow - elbow
-        [0.0, 1.0, 0.0, 0.7],  # Green - wrist 1
-        [0.0, 0.0, 1.0, 0.7],  # Blue - wrist 2
-        [0.5, 0.0, 1.0, 0.7],  # Purple - wrist 3
+        [1.0, 0.0, 0.0, 0.7],  # shoulder pan
+        [1.0, 0.5, 0.0, 0.7],  # shoulder lift
+        [1.0, 1.0, 0.0, 0.7],  # elbow
+        [0.0, 1.0, 0.0, 0.7],  # wrist 1
+        [0.0, 0.0, 1.0, 0.7],  # wrist 2
+        [0.5, 0.0, 1.0, 0.7],  # wrist 3
     ]
-    
-    # Create spheres for each joint at each waypoint
+
+    # Joint trajectory spheres
     for joint_idx in range(6):
         for waypoint_idx in range(MAX_TRAJ_WAYPOINTS):
             marker_body = scene.worldbody.add_body()
             marker_body.name = f"traj_joint{joint_idx}_wp{waypoint_idx}"
-            marker_body.pos = [0, 0, -10]  # Hide initially
+            marker_body.pos = [0, 0, -10]
             marker_body.mocap = True
-            
+
             marker_geom = marker_body.add_geom()
             marker_geom.type = mujoco.mjtGeom.mjGEOM_SPHERE
-            marker_geom.size = [0.015, 0, 0]  # 15mm radius sphere
+            marker_geom.size = [0.015, 0.0, 0.0]
             marker_geom.rgba = JOINT_COLORS[joint_idx]
             marker_geom.contype = 0
             marker_geom.conaffinity = 0
-    
-    # Create line segments connecting waypoints for each joint
-    MAX_TRAJ_SEGMENTS = 11  # MAX_WAYPOINTS - 1
+
+    MAX_TRAJ_SEGMENTS = MAX_TRAJ_WAYPOINTS - 1
+
+    # Joint trajectory line segments (capsules)
     for joint_idx in range(6):
         for seg_idx in range(MAX_TRAJ_SEGMENTS):
             line_body = scene.worldbody.add_body()
             line_body.name = f"traj_line_j{joint_idx}_s{seg_idx}"
             line_body.pos = [0, 0, -10]
             line_body.mocap = True
-            
+
             line_geom = line_body.add_geom()
             line_geom.type = mujoco.mjtGeom.mjGEOM_CAPSULE
-            line_geom.size = [0.004, 0.01, 0]  # Thin line
+            line_geom.size = [0.004, 0.01, 0.0]
             line_geom.rgba = JOINT_COLORS[joint_idx]
             line_geom.contype = 0
             line_geom.conaffinity = 0
-    
-    # Create END-EFFECTOR trajectory visualization (bright white, thicker)
+
+    # End-effector trajectory (white, thicker)
     for waypoint_idx in range(MAX_TRAJ_WAYPOINTS):
         ee_marker = scene.worldbody.add_body()
         ee_marker.name = f"traj_ee_wp{waypoint_idx}"
         ee_marker.pos = [0, 0, -10]
         ee_marker.mocap = True
-        
+
         ee_geom = ee_marker.add_geom()
         ee_geom.type = mujoco.mjtGeom.mjGEOM_SPHERE
-        ee_geom.size = [0.020, 0, 0]  # 20mm radius - BIGGER than joints
-        ee_geom.rgba = [1.0, 1.0, 1.0, 1.0]  # Bright white, fully opaque
+        ee_geom.size = [0.020, 0.0, 0.0]
+        ee_geom.rgba = [1.0, 1.0, 1.0, 1.0]
         ee_geom.contype = 0
         ee_geom.conaffinity = 0
-    
+
     for seg_idx in range(MAX_TRAJ_SEGMENTS):
         ee_line = scene.worldbody.add_body()
         ee_line.name = f"traj_ee_line{seg_idx}"
         ee_line.pos = [0, 0, -10]
         ee_line.mocap = True
-        
+
         ee_line_geom = ee_line.add_geom()
         ee_line_geom.type = mujoco.mjtGeom.mjGEOM_CAPSULE
-        ee_line_geom.size = [0.008, 0.01, 0]  # THICKER than joint lines
-        ee_line_geom.rgba = [1.0, 1.0, 1.0, 1.0]  # Bright white
+        ee_line_geom.size = [0.008, 0.01, 0.0]
+        ee_line_geom.rgba = [1.0, 1.0, 1.0, 1.0]
         ee_line_geom.contype = 0
         ee_line_geom.conaffinity = 0
 
+    # Compile model
     model = scene.compile()
-    model.opt.timestep = 0.0002  # Smaller timestep for stability
+    model.opt.timestep = 0.0002  # physics timestep
 
-    # Add joint damping for smooth, stable control
-    for i in range(6):  # First 6 joints (arm)
+    # Add joint damping
+    for i in range(6):
         model.dof_damping[i] = 10.0
 
     data = mujoco.MjData(model)
     return model, data
 
 
+# ----------------------------------------------------------------------
+# Collision checking & trajectory visualization
+# ----------------------------------------------------------------------
+
+
 def check_collision(model, data, obstacle_geom_ids):
-    """Check if any arm links are colliding with obstacles."""
+    """Check if any arm link is colliding with specified obstacle geoms."""
     for i in range(data.ncon):
         contact = data.contact[i]
         geom1 = contact.geom1
         geom2 = contact.geom2
-        
-        # Check if either geometry is an obstacle
+
         if geom1 in obstacle_geom_ids or geom2 in obstacle_geom_ids:
-            # Get body IDs for both geometries
             body1 = model.geom_bodyid[geom1]
             body2 = model.geom_bodyid[geom2]
             body1_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body1)
             body2_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body2)
-            
-            # Check if it's an arm collision (not gripper-box contact)
-            if body1_name and ("arm_" in body1_name or body2_name and "arm_" in body2_name):
+
+            if body1_name and ("arm_" in body1_name or (body2_name and "arm_" in body2_name)):
                 if "box" not in body1_name and "box" not in body2_name:
                     return True, (body1_name, body2_name)
-    
+
     return False, None
-
-
-def visualize_mpc_trajectory(viewer, model, data_viz, q_trajectory, site_id, data_main=None):
-    """
-    Visualize MPC trajectory showing all 6 joint positions along the planned path.
-    
-    Args:
-        data_viz: Scratch data for computing FK (won't be rendered)
-        data_main: Main simulation data (actually rendered) - mocap will be set here
-    """
-    # Use main data for mocap if provided, otherwise use viz data
-    data_mocap = data_main if data_main is not None else data_viz
-    
-    MAX_WAYPOINTS = 12
-    MAX_SEGMENTS = 11
-    
-    if q_trajectory is None or len(q_trajectory) < 2:
-        # Hide all trajectory markers (joints + EE)
-        for joint_idx in range(6):
-            for wp_idx in range(MAX_WAYPOINTS):
-                try:
-                    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}")
-                    if body_id >= 0:
-                        mocap_id = model.body_mocapid[body_id]
-                        if mocap_id >= 0:
-                            data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-                except:
-                    pass
-            
-            for seg_idx in range(MAX_SEGMENTS):
-                try:
-                    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}")
-                    if body_id >= 0:
-                        mocap_id = model.body_mocapid[body_id]
-                        if mocap_id >= 0:
-                            data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-                except:
-                    pass
-        
-        # Hide EE trajectory
-        for wp_idx in range(MAX_WAYPOINTS):
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-            except:
-                pass
-        
-        for seg_idx in range(MAX_SEGMENTS):
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-            except:
-                pass
-        
-        return
-    
-    # Get body IDs for each joint
-    joint_body_names = [
-        "arm_shoulder_link",
-        "arm_upper_arm_link",
-        "arm_forearm_link",
-        "arm_wrist_1_link",
-        "arm_wrist_2_link",
-        "arm_wrist_3_link"
-    ]
-    
-    joint_body_ids = []
-    for name in joint_body_names:
-        try:
-            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
-            joint_body_ids.append(bid)
-        except:
-            joint_body_ids.append(-1)
-    
-    # Compute positions for all joints + EE site at each waypoint
-    all_joint_positions = []  # Shape: (n_waypoints, 6_joints, 3_xyz)
-    ee_positions = []  # Shape: (n_waypoints, 3_xyz) - actual gripper position
-    
-    for q in q_trajectory:
-        data_viz.qpos[:6] = q
-        mujoco.mj_forward(model, data_viz)
-        
-        # Get joint body positions
-        joint_positions = []
-        for body_id in joint_body_ids:
-            if body_id >= 0:
-                pos = data_viz.xpos[body_id].copy()
-                joint_positions.append(pos)
-            else:
-                joint_positions.append(np.array([0, 0, -10]))
-        
-        all_joint_positions.append(joint_positions)
-        
-        # Get actual EE site position (gripper pinch point)
-        ee_pos = data_viz.site_xpos[site_id].copy()
-        ee_positions.append(ee_pos)
-    
-    all_joint_positions = np.array(all_joint_positions)  # (n_waypoints, 6, 3)
-    ee_positions = np.array(ee_positions)  # (n_waypoints, 3)
-    
-    # Compute total path length (using actual end-effector site)
-    path_length = sum(np.linalg.norm(ee_positions[i+1] - ee_positions[i]) 
-                      for i in range(len(ee_positions)-1))
-    
-    print(f"    → MPC planned {len(q_trajectory)} waypoints, EE path length: {path_length:.3f}m")
-    print(f"    → Visualizing ALL 6 joint trajectories + End-Effector:")
-    print(f"       🔴 Red=Shoulder Pan | 🟠 Orange=Shoulder Lift | 🟡 Yellow=Elbow")
-    print(f"       🟢 Green=Wrist 1 | 🔵 Blue=Wrist 2 | 🟣 Purple=Wrist 3")
-    print(f"       ⚪ BRIGHT WHITE = End-Effector (gripper) - THE MAIN PATH!")
-    
-    # Visualize each joint's trajectory
-    n_waypoints = min(len(q_trajectory), MAX_WAYPOINTS)
-    
-    for joint_idx in range(6):
-        # Place spheres at each waypoint for this joint
-        for wp_idx in range(n_waypoints):
-            pos = all_joint_positions[wp_idx, joint_idx, :]
-            
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = pos
-            except:
-                pass
-        
-        # Hide unused waypoint markers
-        for wp_idx in range(n_waypoints, MAX_WAYPOINTS):
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-            except:
-                pass
-        
-        # Draw lines connecting consecutive waypoints for this joint
-        for seg_idx in range(n_waypoints - 1):
-            p1 = all_joint_positions[seg_idx, joint_idx, :]
-            p2 = all_joint_positions[seg_idx + 1, joint_idx, :]
-            
-            center = (p1 + p2) / 2.0
-            direction = p2 - p1
-            length = np.linalg.norm(direction)
-            
-            if length < 1e-6:
-                # Hide zero-length segments
-                try:
-                    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}")
-                    if body_id >= 0:
-                        mocap_id = model.body_mocapid[body_id]
-                        if mocap_id >= 0:
-                            data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-                except:
-                    pass
-                continue
-            
-            direction = direction / length
-            
-            # Rotation matrix to align capsule with direction
-            z_axis = direction
-            if abs(z_axis[0]) < 0.9:
-                x_axis = np.cross([1, 0, 0], z_axis)
-            else:
-                x_axis = np.cross([0, 1, 0], z_axis)
-            x_axis = x_axis / np.linalg.norm(x_axis)
-            y_axis = np.cross(z_axis, x_axis)
-            
-            rot_mat = np.column_stack([x_axis, y_axis, z_axis])
-            quat = _mat_to_quat(rot_mat)
-            
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = center
-                        data_mocap.mocap_quat[mocap_id] = quat
-                    
-                    # Update capsule length
-                    geom_id = model.body_geomadr[body_id]
-                    if geom_id >= 0:
-                        model.geom_size[geom_id] = [0.004, length / 2.0, 0]
-            except:
-                pass
-        
-        # Hide unused line segments
-        for seg_idx in range(n_waypoints - 1, MAX_SEGMENTS):
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-            except:
-                pass
-    
-    # ===== VISUALIZE END-EFFECTOR TRAJECTORY (BRIGHT WHITE) =====
-    # Place spheres at each EE waypoint
-    for wp_idx in range(n_waypoints):
-        pos = ee_positions[wp_idx]
-        
-        try:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}")
-            if body_id >= 0:
-                mocap_id = model.body_mocapid[body_id]
-                if mocap_id >= 0:
-                    data_mocap.mocap_pos[mocap_id] = pos
-        except:
-            pass
-    
-    # Hide unused EE waypoints
-    for wp_idx in range(n_waypoints, MAX_WAYPOINTS):
-        try:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}")
-            if body_id >= 0:
-                mocap_id = model.body_mocapid[body_id]
-                if mocap_id >= 0:
-                    data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-        except:
-            pass
-    
-    # Draw lines connecting consecutive EE waypoints
-    for seg_idx in range(n_waypoints - 1):
-        p1 = ee_positions[seg_idx]
-        p2 = ee_positions[seg_idx + 1]
-        
-        center = (p1 + p2) / 2.0
-        direction = p2 - p1
-        length = np.linalg.norm(direction)
-        
-        if length < 1e-6:
-            try:
-                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}")
-                if body_id >= 0:
-                    mocap_id = model.body_mocapid[body_id]
-                    if mocap_id >= 0:
-                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-            except:
-                pass
-            continue
-        
-        direction = direction / length
-        
-        # Rotation matrix
-        z_axis = direction
-        if abs(z_axis[0]) < 0.9:
-            x_axis = np.cross([1, 0, 0], z_axis)
-        else:
-            x_axis = np.cross([0, 1, 0], z_axis)
-        x_axis = x_axis / np.linalg.norm(x_axis)
-        y_axis = np.cross(z_axis, x_axis)
-        
-        rot_mat = np.column_stack([x_axis, y_axis, z_axis])
-        quat = _mat_to_quat(rot_mat)
-        
-        try:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}")
-            if body_id >= 0:
-                mocap_id = model.body_mocapid[body_id]
-                if mocap_id >= 0:
-                    data_mocap.mocap_pos[mocap_id] = center
-                    data_mocap.mocap_quat[mocap_id] = quat
-                
-                # Update capsule length
-                geom_id = model.body_geomadr[body_id]
-                if geom_id >= 0:
-                    model.geom_size[geom_id] = [0.008, length / 2.0, 0]
-        except:
-            pass
-    
-    # Hide unused EE line segments
-    for seg_idx in range(n_waypoints - 1, MAX_SEGMENTS):
-        try:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}")
-            if body_id >= 0:
-                mocap_id = model.body_mocapid[body_id]
-                if mocap_id >= 0:
-                    data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
-        except:
-            pass
 
 
 def _mat_to_quat(R):
@@ -617,17 +362,279 @@ def _mat_to_quat(R):
     return np.array([w, x, y, z])
 
 
+def visualize_mpc_trajectory(viewer, model, data_viz, q_trajectory, site_id, data_main=None):
+    """
+    Visualize MPC trajectory for all 6 joint positions and EE.
+
+    If q_trajectory is None, hides all markers.
+    """
+    data_mocap = data_main if data_main is not None else data_viz
+    MAX_WAYPOINTS = 12
+    MAX_SEGMENTS = MAX_WAYPOINTS - 1
+
+    def hide_all():
+        for joint_idx in range(6):
+            for wp_idx in range(MAX_WAYPOINTS):
+                try:
+                    body_id = mujoco.mj_name2id(
+                        model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}"
+                    )
+                    if body_id >= 0:
+                        mocap_id = model.body_mocapid[body_id]
+                        if mocap_id >= 0:
+                            data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+                except Exception:
+                    pass
+            for seg_idx in range(MAX_SEGMENTS):
+                try:
+                    body_id = mujoco.mj_name2id(
+                        model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}"
+                    )
+                    if body_id >= 0:
+                        mocap_id = model.body_mocapid[body_id]
+                        if mocap_id >= 0:
+                            data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+                except Exception:
+                    pass
+
+        for wp_idx in range(MAX_WAYPOINTS):
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}"
+                )
+                if body_id >= 0:
+                    mocap_id = model.body_mocapid[body_id]
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+            except Exception:
+                pass
+
+        for seg_idx in range(MAX_SEGMENTS):
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}"
+                )
+                if body_id >= 0:
+                    mocap_id = model.body_mocapid[body_id]
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+            except Exception:
+                pass
+
+    if q_trajectory is None or len(q_trajectory) < 2:
+        hide_all()
+        return
+
+    # Joint body IDs
+    joint_body_names = [
+        "arm_shoulder_link",
+        "arm_upper_arm_link",
+        "arm_forearm_link",
+        "arm_wrist_1_link",
+        "arm_wrist_2_link",
+        "arm_wrist_3_link",
+    ]
+    joint_body_ids = []
+    for name in joint_body_names:
+        try:
+            joint_body_ids.append(
+                mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+            )
+        except Exception:
+            joint_body_ids.append(-1)
+
+    all_joint_positions = []
+    ee_positions = []
+
+    for q in q_trajectory:
+        data_viz.qpos[:6] = q
+        mujoco.mj_forward(model, data_viz)
+
+        joint_positions = []
+        for bid in joint_body_ids:
+            if bid >= 0:
+                joint_positions.append(data_viz.xpos[bid].copy())
+            else:
+                joint_positions.append(np.array([0.0, 0.0, -10.0]))
+        all_joint_positions.append(joint_positions)
+        ee_positions.append(data_viz.site_xpos[site_id].copy())
+
+    all_joint_positions = np.array(all_joint_positions)  # (N, 6, 3)
+    ee_positions = np.array(ee_positions)                # (N, 3)
+    n_waypoints = min(len(q_trajectory), MAX_WAYPOINTS)
+
+    # Joint markers
+    for joint_idx in range(6):
+        # Waypoint spheres
+        for wp_idx in range(n_waypoints):
+            pos = all_joint_positions[wp_idx, joint_idx, :]
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}"
+                )
+                if body_id >= 0:
+                    mocap_id = model.body_mocapid[body_id]
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = pos
+            except Exception:
+                pass
+        # Hide unused
+        for wp_idx in range(n_waypoints, MAX_WAYPOINTS):
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_joint{joint_idx}_wp{wp_idx}"
+                )
+                if body_id >= 0:
+                    mocap_id = model.body_mocapid[body_id]
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+            except Exception:
+                pass
+
+        # Line segments
+        for seg_idx in range(min(n_waypoints - 1, MAX_SEGMENTS)):
+            p1 = all_joint_positions[seg_idx, joint_idx, :]
+            p2 = all_joint_positions[seg_idx + 1, joint_idx, :]
+            center = (p1 + p2) / 2.0
+            direction = p2 - p1
+            length = np.linalg.norm(direction)
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}"
+                )
+                if body_id < 0:
+                    continue
+                mocap_id = model.body_mocapid[body_id]
+                if length < 1e-6 or mocap_id < 0:
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+                    continue
+
+                direction = direction / length
+                z_axis = direction
+                if abs(z_axis[0]) < 0.9:
+                    x_axis = np.cross([1, 0, 0], z_axis)
+                else:
+                    x_axis = np.cross([0, 1, 0], z_axis)
+                x_axis = x_axis / np.linalg.norm(x_axis)
+                y_axis = np.cross(z_axis, x_axis)
+                R = np.column_stack([x_axis, y_axis, z_axis])
+                quat = _mat_to_quat(R)
+
+                data_mocap.mocap_pos[mocap_id] = center
+                data_mocap.mocap_quat[mocap_id] = quat
+
+                geom_id = model.body_geomadr[body_id]
+                if geom_id >= 0:
+                    model.geom_size[geom_id] = [0.004, length / 2.0, 0.0]
+            except Exception:
+                pass
+
+        # Hide unused segments
+        for seg_idx in range(n_waypoints - 1, MAX_SEGMENTS):
+            try:
+                body_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_BODY, f"traj_line_j{joint_idx}_s{seg_idx}"
+                )
+                if body_id >= 0:
+                    mocap_id = model.body_mocapid[body_id]
+                    if mocap_id >= 0:
+                        data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+            except Exception:
+                pass
+
+    # EE markers
+    for wp_idx in range(n_waypoints):
+        pos = ee_positions[wp_idx]
+        try:
+            body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}"
+            )
+            if body_id >= 0:
+                mocap_id = model.body_mocapid[body_id]
+                if mocap_id >= 0:
+                    data_mocap.mocap_pos[mocap_id] = pos
+        except Exception:
+            pass
+    for wp_idx in range(n_waypoints, MAX_WAYPOINTS):
+        try:
+            body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_wp{wp_idx}"
+            )
+            if body_id >= 0:
+                mocap_id = model.body_mocapid[body_id]
+                if mocap_id >= 0:
+                    data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+        except Exception:
+            pass
+
+    for seg_idx in range(min(n_waypoints - 1, MAX_SEGMENTS)):
+        p1 = ee_positions[seg_idx]
+        p2 = ee_positions[seg_idx + 1]
+        center = (p1 + p2) / 2.0
+        direction = p2 - p1
+        length = np.linalg.norm(direction)
+        try:
+            body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}"
+            )
+            if body_id < 0:
+                continue
+            mocap_id = model.body_mocapid[body_id]
+            if length < 1e-6 or mocap_id < 0:
+                if mocap_id >= 0:
+                    data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+                continue
+
+            direction = direction / length
+            z_axis = direction
+            if abs(z_axis[0]) < 0.9:
+                x_axis = np.cross([1, 0, 0], z_axis)
+            else:
+                x_axis = np.cross([0, 1, 0], z_axis)
+            x_axis = x_axis / np.linalg.norm(x_axis)
+            y_axis = np.cross(z_axis, x_axis)
+            R = np.column_stack([x_axis, y_axis, z_axis])
+            quat = _mat_to_quat(R)
+
+            data_mocap.mocap_pos[mocap_id] = center
+            data_mocap.mocap_quat[mocap_id] = quat
+
+            geom_id = model.body_geomadr[body_id]
+            if geom_id >= 0:
+                model.geom_size[geom_id] = [0.008, length / 2.0, 0.0]
+        except Exception:
+            pass
+
+    for seg_idx in range(n_waypoints - 1, MAX_SEGMENTS):
+        try:
+            body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, f"traj_ee_line{seg_idx}"
+            )
+            if body_id >= 0:
+                mocap_id = model.body_mocapid[body_id]
+                if mocap_id >= 0:
+                    data_mocap.mocap_pos[mocap_id] = [0, 0, -10]
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------
+# Simulation stepping & motion primitives
+# ----------------------------------------------------------------------
+
+
 def settle(model, data, steps=400):
     for _ in range(steps):
         mujoco.mj_step(model, data)
 
 
 def step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook=None):
-    """Step simulation with welded attachment handling."""
+    """Step simulation with welded box attachment."""
     # Gripper command
     data.ctrl[6] = grip
 
-    # Welded attachment of box to gripper
+    # Welded attachment for box (if active)
     if attachment["active"] and attachment["qadr"] >= 0:
         grip_pos = data.site_xpos[site_id].copy()
         ee_body_id = model.site_bodyid[site_id]
@@ -638,24 +645,130 @@ def step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook=Non
         box_offset = attachment["offset"]
         q_rel = attachment["q_rel"]
 
-        # Position (box COM rigidly attached to gripper site + offset)
-        data.qpos[qadr: qadr + 3] = grip_pos + box_offset
-        # Orientation: q_box = q_grip * q_rel
-        box_quat = quat_mul(grip_quat, q_rel)
-        data.qpos[qadr + 3: qadr + 7] = box_quat
+        data.qpos[qadr : qadr + 3] = grip_pos + box_offset
+        data.qpos[qadr + 3 : qadr + 7] = quat_mul(grip_quat, q_rel)
 
-        # Zero free-joint velocities for stability
         if dadr >= 0:
-            data.qvel[dadr: dadr + 6] = 0.0
+            data.qvel[dadr : dadr + 6] = 0.0
 
-    # Advance physics: 250 * 0.0002 = 0.05 s control interval
+    # Integrate physics for one control interval: 250 * 0.0002 = 0.05 s
     mujoco.mj_step(model, data, nstep=250)
 
-    # Viewer sync
+    # Display
     if viewer is not None:
         viewer.sync()
         if fullscreen_hook is not None:
             fullscreen_hook()
+
+
+def move_to_waypoints(
+    model,
+    data,
+    waypoints,
+    steps_per_segment,
+    grip,
+    attachment,
+    site_id,
+    viewer,
+    diag=None,
+    phase="move",
+    fullscreen_hook=None,
+    mpc_controller: MPCController | None = None,
+    obstacle_geom_ids=None,
+    collision_log=None,
+    viz_data=None,
+):
+    """
+    Move through multiple waypoints continuously.
+    
+    MPC plans toward the FINAL waypoint but executes smoothly through intermediate waypoints.
+    """
+    if len(waypoints) == 0:
+        return
+    
+    final_target = np.asarray(waypoints[-1][:6], dtype=float)
+    total_steps = len(waypoints) * steps_per_segment
+    collision_count = 0
+    
+    original_margin = None
+    if mpc_controller is not None and attachment.get("active", False):
+        original_margin = mpc_controller.safety_margin
+        mpc_controller.safety_margin = OBJECT_SAFETY_MARGIN
+        print(f"    Increased safety margin: {mpc_controller.safety_margin:.3f}m (holding object)")
+    
+    if mpc_controller is not None:
+        data_scratch = mujoco.MjData(model)
+        
+        if total_steps > 50:
+            print(f"    🔄 Continuous MPC through {len(waypoints)} waypoints ({total_steps} steps)")
+        
+        for i in range(total_steps):
+            current_q = data.qpos[:6].copy()
+            current_dq = data.qvel[:6].copy()
+            current_state = np.concatenate([current_q, current_dq])
+            
+            # Always plan toward FINAL waypoint (not intermediate)
+            # This allows MPC to see the full path and plan accordingly
+            try:
+                q_cmd, q_traj = mpc_controller.compute_control(
+                    current_state=current_state,
+                    target_state=final_target,
+                    model=model,
+                    data_scratch=data_scratch,
+                    site_id=site_id,
+                )
+            except Exception as e:
+                if i == 0:
+                    print(f"  ⚠️  MPC failed: {e}")
+                # Fallback: interpolate toward final target
+                alpha = (i + 1) / total_steps
+                q_cmd = (1.0 - alpha) * data.qpos[:6].copy() + alpha * final_target
+                q_traj = None
+            
+            if viz_data is not None and q_traj is not None:
+                visualize_mpc_trajectory(viewer, model, viz_data, q_traj, site_id, data_main=data)
+            
+            data.ctrl[:6] = q_cmd
+            step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
+            
+            if obstacle_geom_ids is not None:
+                is_collision, bodies = check_collision(model, data, obstacle_geom_ids)
+                if is_collision:
+                    collision_count += 1
+                    if collision_count == 1:
+                        print(f"    ⚠️  COLLISION in '{phase}': {bodies[0]} <-> {bodies[1]}")
+                    if collision_log is not None:
+                        collision_log.append({
+                            "phase": phase, "step": i, "bodies": bodies,
+                            "position": data.qpos[:6].copy(),
+                        })
+            
+            if diag and i % diag["interval"] == 0:
+                diag["logger"].log_state("box", phase, extra_data={"step": i})
+        
+        if collision_count > 0:
+            print(f"    Total collisions: {collision_count}")
+        
+        if viz_data is not None:
+            visualize_mpc_trajectory(viewer, model, viz_data, None, site_id, data_main=data)
+    else:
+        # Smooth interpolation through waypoints
+        for seg_idx, target_joints in enumerate(waypoints):
+            target = np.asarray(target_joints[:6], dtype=float)
+            start = data.qpos[:6].copy()
+            
+            for i in range(steps_per_segment):
+                alpha = (i + 1) / steps_per_segment
+                alpha_smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+                desired = (1.0 - alpha_smooth) * start + alpha_smooth * target
+                data.ctrl[:6] = desired
+                step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
+                
+                if diag and i % diag["interval"] == 0:
+                    diag["logger"].log_state("box", phase, extra_data={"step": seg_idx * steps_per_segment + i})
+    
+    if original_margin is not None and mpc_controller is not None:
+        mpc_controller.safety_margin = original_margin
 
 
 def move_to(
@@ -670,154 +783,22 @@ def move_to(
     diag=None,
     phase="move",
     fullscreen_hook=None,
-    mpc_controller=None,
+    mpc_controller: MPCController | None = None,
     obstacle_geom_ids=None,
     collision_log=None,
     viz_data=None,
 ):
-    """
-    Move to target joint configuration.
+    """Single-target move (wrapper for backwards compatibility)."""
+    move_to_waypoints(
+        model, data, [target], steps, grip, attachment, site_id, viewer,
+        diag, phase, fullscreen_hook, mpc_controller, obstacle_geom_ids,
+        collision_log, viz_data
+    )
 
-    If mpc_controller is provided, use MPC to generate obstacle-aware joint
-    commands. Otherwise use straight-line interpolation in joint space.
-    """
-    start = data.qpos[:6].copy()
 
-    collision_count = 0
-    
-    # Adjust safety margin if holding an object
-    original_margin = None
-    if mpc_controller is not None and attachment.get("active", False):
-        original_margin = mpc_controller.safety_margin
-        mpc_controller.safety_margin = OBJECT_SAFETY_MARGIN  # 12cm clearance when holding object
-        print(f"    Using increased safety margin: {mpc_controller.safety_margin}m (holding object)")
-    
-    if mpc_controller is not None:
-        # MPC with receding horizon: replan periodically, execute trajectory smoothly
-        data_scratch = mujoco.MjData(model)
-        
-        i = 0
-        traj_buffer = None
-        traj_index = 0
-        prev_cmd = start.copy()
-        steps_since_plan = 999  # Force replan on first iteration
-        REPLAN_INTERVAL = 8  # Replan every 8 steps (regardless of horizon)
-        BLEND_FACTOR = 0.3  # Smooth blending between old and new commands
-        
-        while i < steps:
-            # Replan when buffer is empty OR when interval is reached
-            if traj_buffer is None or traj_index >= len(traj_buffer) or steps_since_plan >= REPLAN_INTERVAL:
-                current_q = data.qpos[:6].copy()
-                current_dq = data.qvel[:6].copy()
-                current_state = np.concatenate([current_q, current_dq])
-                
-                try:
-                    # Time the MPC computation (this is where pauses occur!)
-                    mpc_start = time.time()
-                    _, q_trajectory = mpc_controller.compute_control(
-                        current_state=current_state,
-                        target_state=target[:6],
-                        model=model,
-                        data_scratch=data_scratch,
-                        site_id=site_id,
-                    )
-                    mpc_time = time.time() - mpc_start
-                    if i == 0:  # Only print on first replan
-                        print(f"    ⏱️  MPC computation took {mpc_time:.2f}s")
-                    
-                    # Visualize EVERY MPC plan (updates as robot moves!)
-                    if viz_data is not None:
-                        visualize_mpc_trajectory(viewer, model, viz_data, q_trajectory, site_id, data_main=data)
-                        if i == 0:
-                            print(f"    📍 Visualization will update every {REPLAN_INTERVAL} steps (receding horizon)")
-                    
-                    # Store trajectory for execution (skip first point which is current state)
-                    traj_buffer = q_trajectory[1:]
-                    traj_index = 0
-                    steps_since_plan = 0
-                    
-                except Exception as e:
-                    print(f"  ⚠️  MPC failed at step {i}: {e}")
-                    traj_buffer = None
-            
-            # Get command from trajectory or fallback to interpolation
-            if traj_buffer is not None and traj_index < len(traj_buffer):
-                raw_cmd = traj_buffer[traj_index]
-                traj_index += 1
-            else:
-                # Fallback: simple interpolation
-                alpha = (i + 1) / steps
-                raw_cmd = (1.0 - alpha) * start + alpha * target
-            
-            # Smooth blending with previous command to avoid discontinuities
-            smoothed_cmd = (1 - BLEND_FACTOR) * prev_cmd + BLEND_FACTOR * raw_cmd
-            
-            data.ctrl[:6] = smoothed_cmd
-            prev_cmd = smoothed_cmd.copy()
-            
-            step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
-            
-            # Check for collisions
-            if obstacle_geom_ids is not None:
-                is_collision, bodies = check_collision(model, data, obstacle_geom_ids)
-                if is_collision:
-                    collision_count += 1
-                    if collision_count == 1:  # Report first collision
-                        print(f"    ⚠️  COLLISION detected at step {i}: {bodies[0]} <-> {bodies[1]}")
-                    if collision_log is not None:
-                        collision_log.append({
-                            "phase": phase,
-                            "step": i,
-                            "bodies": bodies,
-                            "position": data.qpos[:6].copy()
-                        })
-            
-            if diag and i % diag["interval"] == 0:
-                diag["logger"].log_state("box", phase, extra_data={"step": i})
-            
-            i += 1
-            steps_since_plan += 1
-        
-        if collision_count > 0:
-            print(f"    Total collisions in phase '{phase}': {collision_count}")
-        
-        # Clear visualization after move completes
-        if viz_data is not None:
-            visualize_mpc_trajectory(viewer, model, viz_data, None, site_id, data_main=data)
-    else:
-        # Smooth joint-space interpolation (no obstacle awareness)
-        for i in range(steps):
-            alpha = (i + 1) / steps
-            alpha_smooth = alpha * alpha * (3.0 - 2.0 * alpha)  # smoothstep
-            desired = (1.0 - alpha_smooth) * start + alpha_smooth * target
-            data.ctrl[:6] = desired
-
-            step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
-            
-            # Check for collisions
-            if obstacle_geom_ids is not None:
-                is_collision, bodies = check_collision(model, data, obstacle_geom_ids)
-                if is_collision:
-                    collision_count += 1
-                    if collision_count == 1:  # Report first collision
-                        print(f"    ⚠️  COLLISION detected at step {i}: {bodies[0]} <-> {bodies[1]}")
-                    if collision_log is not None:
-                        collision_log.append({
-                            "phase": phase,
-                            "step": i,
-                            "bodies": bodies,
-                            "position": data.qpos[:6].copy()
-                        })
-
-            if diag and i % diag["interval"] == 0:
-                diag["logger"].log_state("box", phase, extra_data={"alpha": float(alpha)})
-        
-        if collision_count > 0:
-            print(f"    Total collisions in phase '{phase}': {collision_count}")
-    
-    # Restore original safety margin if it was changed
-    if original_margin is not None and mpc_controller is not None:
-        mpc_controller.safety_margin = original_margin
+# ----------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------
 
 
 def main():
@@ -825,71 +806,76 @@ def main():
 
     if args.headless or args.diagnostics:
         import matplotlib
+
         matplotlib.use("Agg", force=True)
 
     print("=" * 70)
     print("COLOR-BASED WAREHOUSE SORTING DEMO")
     print("=" * 70)
-    print("Layout:")
-    print("  Baskets (top/bottom) ← Boxes (far side) → Obstacle (middle)")
-    print("  Red boxes → Top basket | Blue boxes → Bottom basket")
+    print("Layout: Boxes (center) → Wall (middle) → Baskets (left)")
+    print("Red boxes → red basket | Blue boxes → blue basket")
     print("=" * 70)
 
     model, data = build_world()
 
-    # Flip shoulder to face scene
-    model.key_qpos[0][model.jnt("arm_shoulder_pan_joint").qposadr] += np.pi
-    model.key_ctrl[0][model.jnt("arm_shoulder_pan_joint").dofadr] += np.pi
+    # Rotate shoulder to face the scene
+    shoulder_joint = model.jnt("arm_shoulder_pan_joint")
+    model.key_qpos[0][shoulder_joint.qposadr] += np.pi
+    model.key_ctrl[0][shoulder_joint.dofadr] += np.pi
     mujoco.mj_resetDataKeyframe(model, data, 0)
 
     # Let everything settle
     settle(model, data, steps=500)
 
+    # IK for end-effector
     ik = IKSolver(model, data, site_name=EE_SITE)
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, EE_SITE)
-    
-    # Create scratch data for visualization (never touch the real sim state!)
+
+    # Separate data for visualization FK (never rendered directly)
     viz_data = mujoco.MjData(model)
 
     # Initialize MPC
-    print("\nInitializing MPC controller with obstacle avoidance...")
-    # dt must match control loop: 250 * model.opt.timestep = 0.05
+    print("\nInitializing MPC...")
     mpc_controller = MPCController(
         n_joints=6,
-        horizon=10,
-        dt=0.05,
+        horizon=10,   # Fixed horizon: 10 * 0.05s = 0.5s lookahead
+        dt=0.05,      # Control period (one step_sim call)
     )
-    
-    # Set safety margin to match visualization
     mpc_controller.safety_margin = BASE_SAFETY_MARGIN
+    print(f"  TRUE receding horizon: MPC solves at EVERY control step")
+    print(f"  Horizon fixed at H={mpc_controller.horizon} (planning {mpc_controller.horizon * mpc_controller.dt:.2f}s ahead)")
+    print(f"  MPC will solve at EVERY control step (true receding horizon)")
+    print(f"  Horizon always H={mpc_controller.horizon}, planning {mpc_controller.horizon * mpc_controller.dt:.2f}s ahead")
 
-    # Add obstacles to MPC and collect geometry IDs for collision detection
+    # Add only the wall as an obstacle to MPC & for collision detection
     obstacle_geom_ids = []
-    for obstacle_name in ["obstacle_center_wall"]:
-        try:
-            obs_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, obstacle_name)
-            if obs_body_id >= 0:
-                obs_pos = data.xpos[obs_body_id].copy()
-                for gid in range(model.ngeom):
-                    if model.geom_bodyid[gid] == obs_body_id:
-                        obs_size = model.geom_size[gid].copy()
-                        mpc_controller.add_obstacle(obs_pos, obs_size)
-                        obstacle_geom_ids.append(gid)  # Track for collision detection
-                        print(f"  Added obstacle: {obstacle_name} (geom_id={gid})")
-                        break
-        except Exception as e:
-            print(f"  Warning: Could not add obstacle {obstacle_name}: {e}")
+    try:
+        obs_body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, "obstacle_center_wall"
+        )
+        if obs_body_id >= 0:
+            obs_pos = data.xpos[obs_body_id].copy()
+            for gid in range(model.ngeom):
+                if model.geom_bodyid[gid] == obs_body_id:
+                    obs_size = model.geom_size[gid].copy()
+                    mpc_controller.add_obstacle(obs_pos, obs_size)
+                    obstacle_geom_ids.append(gid)
+                    print(f"  Added wall obstacle for MPC and collision checks (geom_id={gid})")
+                    break
+    except Exception as e:
+        print(f"  Warning: could not add wall obstacle: {e}")
 
     # Initialize which arm links to use in collision checks
     mpc_controller.initialize_link_bodies(model)
 
-    print(f"MPC ready with {len(mpc_controller.obstacles)} obstacles")
-    print("\nObstacle Safety Margins Visualized:")
-    print(f"  🟧 Orange Box = Actual obstacle (hard collision)")
-    print(f"  🟥 Red Zone = Base safety margin (5cm) - MPC avoids this")
-    print(f"  🟨 Yellow Zone = Extended margin (8cm) - used when holding objects")
+    print(f"✓ MPC ready with {len(mpc_controller.obstacles)} obstacles")
+    print("\nObstacle Safety Margins:")
+    print(f"  Wall half-size: from XML.")
+    print(f"  Soft cost margin (no box): {BASE_SAFETY_MARGIN*100:.1f} cm")
+    print(f"  Soft cost margin (with box): {OBJECT_SAFETY_MARGIN*100:.1f} cm")
     print("=" * 70)
 
+    # Viewer
     viewer = None
     fullscreen_hook = None
     if not args.headless and HAS_VIEWER:
@@ -897,28 +883,27 @@ def main():
         fullscreen_hook = FullscreenEnforcer(viewer)
         fullscreen_hook()
 
+    # Diagnostics
     diag = None
     if args.diagnostics:
         diag_logger = DiagnosticLogger(model, data, site_name=EE_SITE)
         diag = {"logger": diag_logger, "interval": max(1, args.diag_interval)}
 
-    # Collect box information
+    # Collect box info (free joints)
     boxes = []
     for cfg in BOXES:
         body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, cfg["name"])
         if body_id < 0:
             continue
-
         jnt_adr = model.body_jntadr[body_id]
-        joint_id = jnt_adr
-        qadr = int(model.jnt_qposadr[joint_id])
-        dadr = int(model.jnt_dofadr[joint_id])
+        qadr = int(model.jnt_qposadr[jnt_adr])
+        dadr = int(model.jnt_dofadr[jnt_adr])
 
         boxes.append(
             {
                 "name": cfg["name"],
                 "body_id": body_id,
-                "joint_id": joint_id,
+                "joint_id": jnt_adr,
                 "qadr": qadr,
                 "dadr": dadr,
                 "size": cfg["size"],
@@ -936,15 +921,16 @@ def main():
             if model.geom_bodyid[gid] == basket_body:
                 basket_geom_id = gid
                 break
+        thickness = model.geom_size[basket_geom_id][2] if basket_geom_id is not None else 0.02
         baskets[color] = {
             "body_id": basket_body,
             "geom_id": basket_geom_id,
-            "thickness": model.geom_size[basket_geom_id][2] if basket_geom_id is not None else 0.02,
+            "thickness": thickness,
         }
 
     # Common poses
-    down_quat = np.array([0.0, 1.0, 0.0, 0.0])
-    mid_clear = np.array([0.50, -0.35, 0.85])  # clear position high above workspace
+    down_quat = np.array([0.0, 1.0, 0.0, 0.0], dtype=float)
+    mid_clear = np.array([0.50, -0.35, 0.85], dtype=float)
     mid_clear_joints, _ = ik.solve(
         mid_clear,
         target_quat=down_quat,
@@ -959,14 +945,15 @@ def main():
         "qadr": -1,
         "dadr": -1,
         "body_id": -1,
-        "offset": np.zeros(3),
+        "offset": np.zeros(3, dtype=float),
         "q_rel": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
     }
 
-    # Collision tracking
     collision_log = []
-    
+
+    # ------------------------------------------------------------------
     # Main sorting loop
+    # ------------------------------------------------------------------
     for idx, box in enumerate(boxes):
         box_name = box["name"]
         box_color = box["color"]
@@ -975,28 +962,26 @@ def main():
         box_dadr = box["dadr"]
         box_size = box["size"]
 
-        print(f"\n{'='*70}")
-        print(f"Sorting {box_name} ({box_color}) → {box_color} basket ({idx+1}/{len(boxes)})")
-        print(f"{'='*70}")
+        print("\n" + "=" * 70)
+        print(f"[{idx+1}/{len(boxes)}] {box_name} ({box_color}) → {box_color} basket")
+        print("=" * 70)
 
-        # Current box COM (tracks even if box moved!)
+        # Current box COM
         box_pos = data.xpos[box_body].copy()
-        print(f"  Box {box_name} current position: {box_pos}")
-        print(f"  Box original position: {BOXES[idx]['pos']}")
-        
-        # Check if box fell off table or moved too far
-        if box_pos[2] < 0.40:  # Below table height
-            print(f"  ⚠️  Box {box_name} fell off table (z={box_pos[2]:.3f}m), skipping")
-            continue
-        
-        # Waypoints for picking
-        above = box_pos.copy()
-        above[2] += 0.12  # 12 cm above box center
+        print(f"  Box position: {box_pos}")
 
-        # Target contact position: slightly above the box COM (toward top face)
+        # Skip if box fell off table
+        if box_pos[2] < 0.40:
+            print(f"  ⚠️  Box {box_name} fell off table (z={box_pos[2]:.3f}), skipping.")
+            continue
+
+        # Approach and contact poses
+        above = box_pos.copy()
+        above[2] += 0.12
+
         contact = box_pos.copy()
         contact[2] += box_size * 0.5  # move toward top face
-        contact[2] -= 0.005           # small downward offset so gripper "sits" on box
+        contact[2] -= 0.005           # small downward offset
 
         above_joints, above_success = ik.solve(
             above, target_quat=down_quat, max_iterations=500, tolerance=0.003
@@ -1004,73 +989,70 @@ def main():
         contact_joints, contact_success = ik.solve(
             contact, target_quat=down_quat, max_iterations=800, tolerance=0.002
         )
-        
-        if not above_success:
-            print(f"  ⚠️  IK failed for 'above' position at {above}")
-        if not contact_success:
-            print(f"  ⚠️  IK failed for 'contact' position at {contact}")
 
-        # Ensure gripper is fully open before approaching
+        if not above_success:
+            print(f"  ⚠️  IK failed for 'above' pose at {above}")
+        if not contact_success:
+            print(f"  ⚠️  IK failed for 'contact' pose at {contact}")
+
+        # Make sure gripper is open
         print("Opening gripper...")
         for _ in range(50):
-            step_sim(model, data, attachment, site_id, 0, viewer, fullscreen_hook)
+            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
 
-        # 1) Move above box (simple interpolation)
-        print("Moving above box...")
+        # Move above box (no MPC, direct)
+        print("Approaching above box...")
         move_to(
             model,
             data,
             above_joints[:6],
-            300,
-            0,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "approach_above",
-            fullscreen_hook,
+            steps=300,
+            grip=0,
+            attachment=attachment,
+            site_id=site_id,
+            viewer=viewer,
+            diag=diag,
+            phase="approach_above",
+            fullscreen_hook=fullscreen_hook,
             mpc_controller=None,
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
         )
 
-        # 2) Lower to contact position
+        # Lower to contact (no MPC, precise)
         print("Lowering to box...")
         move_to(
             model,
             data,
             contact_joints[:6],
-            300,
-            0,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "lower",
-            fullscreen_hook,
+            steps=300,
+            grip=0,
+            attachment=attachment,
+            site_id=site_id,
+            viewer=viewer,
+            diag=diag,
+            phase="lower",
+            fullscreen_hook=fullscreen_hook,
             mpc_controller=None,
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
         )
 
-        # Let physics settle after lowering
+        # Let physics settle
         for _ in range(50):
-            step_sim(model, data, attachment, site_id, 0, viewer, fullscreen_hook)
+            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
 
-        # Recompute positions after settling
-        GRASP_THRESH = 0.050  # 5 cm threshold (increased from 1.5cm for reliability)
+        # Check distance EE ↔ box COM
+        GRASP_THRESH = 0.050
         grip_pos = data.site_xpos[site_id].copy()
         box_now = data.xpos[box_body].copy()
-        dist = np.linalg.norm(grip_pos - box_now)
+        dist = float(np.linalg.norm(grip_pos - box_now))
+        print(f"  Distance to box: {dist*1000:.1f} mm (threshold {GRASP_THRESH*1000:.1f} mm)")
 
-        print(f"  Distance to box: {dist*1000:.1f}mm (threshold: {GRASP_THRESH*1000:.1f}mm)")
-        print(f"  Gripper at: {grip_pos}")
-        print(f"  Box at: {box_now}")
-
+        # Optional refinement
         if dist >= GRASP_THRESH:
-            # Optional: one more local IK refinement directly to box COM
             refine_joints, success = ik.solve(
                 box_now,
                 target_quat=down_quat,
@@ -1078,66 +1060,75 @@ def main():
                 tolerance=0.0015,
             )
             if success:
-                print("  Refining grasp pose to better align with box center...")
+                print("  Refining grasp pose...")
                 move_to(
                     model,
                     data,
                     refine_joints[:6],
-                    150,
-                    0,
-                    attachment,
-                    site_id,
-                    viewer,
-                    diag,
-                    "refine_grasp",
-                    fullscreen_hook,
+                    steps=150,
+                    grip=0,
+                    attachment=attachment,
+                    site_id=site_id,
+                    viewer=viewer,
+                    diag=diag,
+                    phase="refine_grasp",
+                    fullscreen_hook=fullscreen_hook,
                     mpc_controller=None,
                     obstacle_geom_ids=obstacle_geom_ids,
                     collision_log=collision_log,
                     viz_data=viz_data,
                 )
                 for _ in range(30):
-                    step_sim(model, data, attachment, site_id, 0, viewer, fullscreen_hook)
+                    step_sim(
+                        model,
+                        data,
+                        attachment,
+                        site_id,
+                        grip=0,
+                        viewer=viewer,
+                        fullscreen_hook=fullscreen_hook,
+                    )
                 grip_pos = data.site_xpos[site_id].copy()
                 box_now = data.xpos[box_body].copy()
-                dist = np.linalg.norm(grip_pos - box_now)
-                print(f"  Distance after refine: {dist*1000:.1f}mm")
+                dist = float(np.linalg.norm(grip_pos - box_now))
+                print(f"  Distance after refine: {dist*1000:.1f} mm")
             else:
-                print(f"  ⚠️  IK refinement failed, keeping original distance {dist*1000:.1f}mm")
+                print("  IK refinement failed.")
 
+        # Attach box if close enough
         if dist < GRASP_THRESH:
             ee_body_id = model.site_bodyid[site_id]
             grip_quat = data.xquat[ee_body_id].copy()
             box_quat = data.xquat[box_body].copy()
             q_rel = quat_mul(quat_conj(grip_quat), box_quat)
 
-            # SNAP BOX COM EXACTLY TO GRIPPER SITE
-            data.qpos[box_qadr: box_qadr + 3] = grip_pos
-            data.qpos[box_qadr + 3: box_qadr + 7] = box_quat
+            # Snap box COM exactly to gripper site
+            data.qpos[box_qadr : box_qadr + 3] = grip_pos
+            data.qpos[box_qadr + 3 : box_qadr + 7] = box_quat
             mujoco.mj_forward(model, data)
 
             attachment["active"] = True
             attachment["qadr"] = box_qadr
             attachment["dadr"] = box_dadr
             attachment["body_id"] = box_body
-            attachment["offset"] = np.zeros(3)  # COM exactly at EE site
+            attachment["offset"] = np.zeros(3, dtype=float)
             attachment["q_rel"] = q_rel
 
-            print(f"✓ {box_name} attached to gripper (distance {dist:.3f}m, snapped to center)")
+            print(f"✓ {box_name} attached (distance {dist:.3f} m)")
         else:
             attachment["active"] = False
             attachment["qadr"] = -1
             attachment["dadr"] = -1
             attachment["body_id"] = -1
-            attachment["offset"] = np.zeros(3)
+            attachment["offset"] = np.zeros(3, dtype=float)
             attachment["q_rel"] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-            print(f"✗ {box_name} out of reach (distance {dist:.3f}m); skipping")
+            print(f"✗ {box_name} out of reach (distance {dist:.3f} m); skipping")
             continue
 
         # Close gripper
         print("Closing gripper...")
         for i in range(150):
-            step_sim(model, data, attachment, site_id, 255, viewer, fullscreen_hook)
+            step_sim(model, data, attachment, site_id, grip=255, viewer=viewer, fullscreen_hook=fullscreen_hook)
             if diag and i % diag["interval"] == 0:
                 diag["logger"].log_state("box", "close", extra_data={"step": i})
 
@@ -1145,84 +1136,71 @@ def main():
             print("Attachment failed; skipping placement for this box.")
             continue
 
-        # Basket placement
+        # Basket placement target
         basket_info = baskets[box_color]
         basket_pos = data.xpos[basket_info["body_id"]].copy()
         basket_top_z = basket_pos[2] + basket_info["thickness"]
 
-        drop_margin = 0.005  # 5 mm above basket floor
+        drop_margin = 0.005
         place_pos = basket_pos.copy()
         place_pos[2] = basket_top_z + box_size + drop_margin
 
-        # With offset == 0, EE site goes exactly to desired COM place position
-        place_ee = place_pos.copy()
-        approach_ee = place_ee.copy()
+        approach_ee = place_pos.copy()
         approach_ee[2] += 0.10
 
         approach_joints, _ = ik.solve(
-            approach_ee, target_quat=down_quat, max_iterations=500, tolerance=0.01
+            approach_ee,
+            target_quat=down_quat,
+            max_iterations=500,
+            tolerance=0.01,
         )
         place_joints, _ = ik.solve(
-            place_ee, target_quat=down_quat, max_iterations=600, tolerance=0.005
+            place_pos,
+            target_quat=down_quat,
+            max_iterations=600,
+            tolerance=0.005,
         )
 
-        # Transport to basket with MPC (obstacle-aware)
-        print(f"Transporting to {box_color} basket...")
-        move_to(
+        # Transport with MPC (ONE continuous motion through waypoints)
+        print(f"Transporting {box_name} → {box_color} basket...")
+        move_to_waypoints(
             model,
             data,
-            mid_clear_joints[:6],
-            300,
-            255,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "lift_high",
-            fullscreen_hook,
-            mpc_controller=mpc_controller,
-            obstacle_geom_ids=obstacle_geom_ids,
-            collision_log=collision_log,
-            viz_data=viz_data,
-        )
-        move_to(
-            model,
-            data,
-            approach_joints[:6],
-            300,
-            255,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "approach_basket",
-            fullscreen_hook,
+            waypoints=[mid_clear_joints[:6], approach_joints[:6]],  # Two waypoints
+            steps_per_segment=300,
+            grip=255,
+            attachment=attachment,
+            site_id=site_id,
+            viewer=viewer,
+            diag=diag,
+            phase="transport",
+            fullscreen_hook=fullscreen_hook,
             mpc_controller=mpc_controller,
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
         )
 
-        # Precise lowering into basket (no MPC for final centimeters)
+        # Precise lowering into basket (no MPC)
         move_to(
             model,
             data,
             place_joints[:6],
-            200,
-            255,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "pre_place",
-            fullscreen_hook,
+            steps=200,
+            grip=255,
+            attachment=attachment,
+            site_id=site_id,
+            viewer=viewer,
+            diag=diag,
+            phase="pre_place",
+            fullscreen_hook=fullscreen_hook,
             mpc_controller=None,
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
         )
 
-        # Release and open gripper
+        # Release box
         print(f"Releasing into {box_color} basket...")
         attachment["active"] = False
         attachment["qadr"] = -1
@@ -1230,92 +1208,75 @@ def main():
         attachment["body_id"] = -1
         attachment["q_rel"] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         for i in range(200):
-            step_sim(model, data, attachment, site_id, 0, viewer, fullscreen_hook)
+            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
             if diag and i % diag["interval"] == 0:
                 diag["logger"].log_state("box", "release", extra_data={"step": i})
 
-        # Retreat with MPC (stay away from obstacle)
-        print("Retreating from basket...")
-        move_to(
+        # Retreat with MPC (ONE continuous motion through waypoints)
+        print("Retreating...")
+        move_to_waypoints(
             model,
             data,
-            approach_joints[:6],
-            200,
-            0,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "retreat_from_basket",
-            fullscreen_hook,
-            mpc_controller=mpc_controller,
-            obstacle_geom_ids=obstacle_geom_ids,
-            collision_log=collision_log,
-            viz_data=viz_data,
-        )
-        move_to(
-            model,
-            data,
-            mid_clear_joints[:6],
-            200,
-            0,
-            attachment,
-            site_id,
-            viewer,
-            diag,
-            "retreat_clear",
-            fullscreen_hook,
+            waypoints=[approach_joints[:6], mid_clear_joints[:6]],  # Back through waypoints
+            steps_per_segment=200,
+            grip=0,
+            attachment=attachment,
+            site_id=site_id,
+            viewer=viewer,
+            diag=diag,
+            phase="retreat",
+            fullscreen_hook=fullscreen_hook,
             mpc_controller=mpc_controller,
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
         )
 
-    # Go home at end with MPC
+    # Return home using MPC
     print("\nReturning to home position...")
     move_to(
         model,
         data,
         home_joints,
-        300,
-        0,
-        attachment,
-        site_id,
-        viewer,
-        diag,
-        "return_home",
-        fullscreen_hook,
+        steps=300,
+        grip=0,
+        attachment=attachment,
+        site_id=site_id,
+        viewer=viewer,
+        diag=diag,
+        phase="return_home",
+        fullscreen_hook=fullscreen_hook,
         mpc_controller=mpc_controller,
         obstacle_geom_ids=obstacle_geom_ids,
         collision_log=collision_log,
         viz_data=viz_data,
     )
 
+    # Summary
     print("\n" + "=" * 70)
-    print("✓ SORTING COMPLETE!")
+    print("✓ SORTING COMPLETE")
     print("=" * 70)
 
     for box in boxes:
         final_pos = data.xpos[box["body_id"]].copy()
-        print(f"{box['name']} ({box['color']}): {final_pos}")
-    
-    # Collision summary
+        print(f"{box['name']} ({box['color']}): final position {final_pos}")
+
     print("\n" + "=" * 70)
     print("COLLISION REPORT")
     print("=" * 70)
-    if len(collision_log) == 0:
-        print("✓ No collisions detected!")
+    if not collision_log:
+        print("✓ No collisions detected.")
     else:
         print(f"⚠️  Total collisions: {len(collision_log)}")
-        # Group by phase
         from collections import defaultdict
+
         by_phase = defaultdict(int)
         for entry in collision_log:
             by_phase[entry["phase"]] += 1
-        
+
         print("\nCollisions by phase:")
         for phase, count in sorted(by_phase.items()):
-            print(f"  {phase}: {count} collisions")
+            print(f"  {phase}: {count}")
     print("=" * 70)
 
     if diag:
