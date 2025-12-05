@@ -25,10 +25,10 @@ camera:
 
 # MPC Parameters
 mpc:
-  horizon: 5  # Prediction horizon (steps) - 10 * 0.05s = 0.5s lookahead
+  horizon: 5  # Prediction horizon (steps) - 5 * 0.05s = 0.25s lookahead
   dt: 0.05  # Time step in seconds (must match control loop: 250 * 0.0002s = 0.05s)
-  max_iterations: 3  # Aggressive limit for real-time performance
-  convergence_threshold: 5e-3  # Relaxed for speed
+  max_iterations: 5  # Max Ipopt iterations per solve (real-time tuning)
+  convergence_threshold: 5e-3  # Relaxed tolerance for real-time performance
   execution_mode: "receding_horizon"  # Solve MPC at EVERY control step
   
   # Cost weights
@@ -47,9 +47,11 @@ mpc:
   # Collision avoidance (multi-link protection)
   safety_margin: 0.05  # meters - minimum clearance from obstacles (5cm)
   object_clearance: 0.03  # meters - extra margin when holding objects (+3cm = 8cm total)
-  collision_check_points: 4  # Number of arm points checked (shoulder, elbow, wrist, EE)
-  constraint_type: "hard"  # Hard constraint: cannot penetrate obstacles
-  margin_type: "soft_cost"  # Soft penalty for safety margin violations
+  collision_check_points: 7  # Number of arm link bodies checked (base → wrist3)
+  collision_strategy: "post_solve_rejection"  # Reject trajectories with actual penetration only
+  # Note: Trajectories are only rejected if they actually penetrate obstacle geometry,
+  # not just for coming within safety_margin. This reduces false rejections and allows
+  # smoother, more natural motion while still guaranteeing collision-free execution.
   
   # Trajectory execution
   # True receding horizon: MPC solved every control step

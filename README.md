@@ -2,7 +2,7 @@
 
 **EECS/BioE/MechE 106A/206A - Fall 2025**
 
-Model Predictive Control for robotic manipulation with neural network imitation learning and comprehensive diagnostic tools.
+Model Predictive Control for robotic manipulation with analytical kinematics and comprehensive diagnostic tools.
 
 ## Team
 
@@ -13,14 +13,15 @@ Model Predictive Control for robotic manipulation with neural network imitation 
 
 ## Project Overview
 
-This project implements Model Predictive Control (MPC) for a UR5e robotic arm with neural network-based obstacle avoidance and imitation learning capabilities.
+This project implements Model Predictive Control (MPC) for a UR5e robotic arm with analytical kinematics and real-time obstacle avoidance.
 
 **Key Components:**
 - ✅ Position-space MPC using CasADi optimization
-- ✅ Neural network FK for real-time obstacle avoidance
-- ✅ Inverse kinematics for reach planning
-- ✅ Shelf-based warehouse sorting demonstration
-- ✅ Comprehensive diagnostic and logging utilities
+- ✅ Analytical forward kinematics (DH parameters)
+- ✅ Inverse kinematics solver for reach planning
+- ✅ Real-time receding horizon control
+- ✅ Warehouse color-sorting demonstration
+- ✅ Comprehensive diagnostic and test suite
 
 ---
 
@@ -48,34 +49,33 @@ The UR5e picks three cubes and stacks them on a shelf.
 ```bash
 uv run mjpython scripts/demo_color_sorting.py
 ```
-Sort red and blue boxes into separate baskets. Obstacles block direct paths, forcing MPC to plan intelligent trajectories using NN FK obstacle avoidance.
+Sort red and blue boxes into separate baskets. MPC uses real-time receding horizon control with waypoint guidance to navigate around obstacles.
 
-### Optional: NN FK for Obstacle Avoidance
+### Run Tests
 
-One-time setup for advanced obstacle avoidance:
+Verify kinematics implementation:
 
 ```bash
-# Full setup with visualization (5-10 min)
-uv run python tools/nn_fk/setup.py
+# Run all tests
+uv run python tests/run_all_tests.py
 
-# Quick mode (30 sec)
-uv run python tools/nn_fk/setup.py --quick
-
-# See performance diagrams
-uv run python tools/nn_fk/visualize_performance.py
-open data/diagnostics/nn_fk_performance.png
+# Run individual tests
+uv run python tests/test_forward_kinematics.py
+uv run python tests/test_inverse_kinematics.py
 ```
 
-See [TRAINING_GUIDE.md](TRAINING_GUIDE.md) for training details and [docs/GUIDE.md](docs/GUIDE.md) for full documentation.
+See [tests/README.md](tests/README.md) for test documentation.
 
 ---
 
 ## Features
 
-- **MPC Controller**: Position-space control with NN FK obstacle avoidance
+- **MPC Controller**: Real-time receding horizon control with CasADi/IPOPT
+- **Forward Kinematics**: Analytical FK using DH parameters
 - **Inverse Kinematics**: Damped least squares IK solver
-- **Diagnostics**: Comprehensive logging and 12-subplot visualizations
-- **Imitation Learning**: Neural network learns from MPC demonstrations
+- **Obstacle Avoidance**: MuJoCo-based collision detection
+- **Diagnostics**: Comprehensive logging and visualizations
+- **Test Suite**: Automated FK/IK validation
 
 See [docs/GUIDE.md](docs/GUIDE.md) for detailed documentation.
 
@@ -84,20 +84,21 @@ See [docs/GUIDE.md](docs/GUIDE.md) for detailed documentation.
 ## Project Structure
 
 ```
-├── scripts/          # Demos
-│   └── demo_sorting.py
-├── tools/            # Training utilities
-│   └── nn_fk/        # NN FK setup scripts
+├── scripts/          # Demonstration scripts
+│   ├── demo_sorting.py
+│   └── demo_color_sorting.py
+├── tests/            # Test suite
+│   ├── test_forward_kinematics.py
+│   ├── test_inverse_kinematics.py
+│   └── run_all_tests.py
 ├── src/              # Source code
-│   ├── control/      # MPC, IK, NN FK
-│   ├── diagnostics/  # Logging
+│   ├── control/      # MPC, FK, IK controllers
+│   ├── diagnostics/  # Logging utilities
 │   ├── learning/     # Imitation learning
 │   └── perception/   # State estimation
-├── sim/models/       # MuJoCo models
-├── config/           # Configuration
-├── data/             # Generated data
-└── docs/             # Documentation
-    └── GUIDE.md
+├── sim/models/       # MuJoCo URDF/XML models
+├── config/           # System configuration
+└── data/             # Generated data
 ```
 
 ## Documentation
