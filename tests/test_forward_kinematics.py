@@ -1,236 +1,232 @@
-#!/usr/bin/env python3
 """
-Test suite for Forward Kinematics (FK) implementation.
+Test forward kinematics accuracy against MuJoCo.
 
-Verifies that analytical FK matches MuJoCo FK to within acceptable tolerances.
+This test compares the analytic FK implementation with MuJoCo's FK
+to ensure they produce consistent end-effector positions.
 """
 
-import sys
-from pathlib import Path
 import numpy as np
 import mujoco
+import pytest
+from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from src.control.forward_kinematics import FKSolver
+from src.control.forward_kinematics import build_ur5e_fk_function
 
 
-def load_ur5e_model():
-    """Load UR5e + gripper model."""
-    MODELS_DIR = Path(__file__).parent.parent / "sim" / "models"
-    scene = mujoco.MjSpec.from_file(str(MODELS_DIR / "scene.xml"))
-    arm_spec = mujoco.MjSpec.from_file(str(MODELS_DIR / "universal_robots_ur5e" / "ur5e.xml"))
-    hand_spec = mujoco.MjSpec.from_file(str(MODELS_DIR / "robotiq_2f85" / "2f85.xml"))
+@pytest.fixture
+def mujoco_model():
+    """Build MuJoCo model with robot for testing (same as demos)."""
+    models_dir = Path(__file__).parent.parent / "sim" / "models"
+    scene_path = models_dir / "scene.xml"
+    arm_path = models_dir / "universal_robots_ur5e" / "ur5e.xml"
+    hand_path = models_dir / "robotiq_2f85" / "2f85.xml"
     
+    if not scene_path.exists():
+        pytest.skip(f"Scene model not found at {scene_path}")
+    if not arm_path.exists():
+        pytest.skip(f"Arm model not found at {arm_path}")
+    if not hand_path.exists():
+        pytest.skip(f"Hand model not found at {hand_path}")
+    
+    # Build world with robot (same as demo scripts)
+    scene = mujoco.MjSpec.from_file(str(scene_path))
+    arm_spec = mujoco.MjSpec.from_file(str(arm_path))
+    hand_spec = mujoco.MjSpec.from_file(str(hand_path))
+    
+    # Attach hand to arm, arm to scene
     arm_spec.site("attachment_site").attach_body(hand_spec.worldbody, "hand_", "")
     scene.site("robot_site").attach_body(arm_spec.worldbody, "arm_", "")
     
-    model = scene.compile()
-    data = mujoco.MjData(model)
-    
-    return model, data
+    return scene.compile()
 
 
-def test_fk_accuracy():
-    """Test FK consistency on random configurations."""
-    print("=" * 70)
-    print("FK CONSISTENCY TEST")
-    print("=" * 70)
-    print("NOTE: FKSolver uses MuJoCo internally, so errors should be ~0")
-    print()
-    
-    model, data = load_ur5e_model()
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "arm_hand_pinch")
-    fk_solver = FKSolver(model=model, site_name="arm_hand_pinch")
-    
-    n_tests = 100
-    errors = []
-    max_error = 0.0
-    max_error_q = None
-    
-    print(f"Testing {n_tests} random joint configurations...")
-    print()
-    
-    for i in range(n_tests):
-        # Random configuration
-        q = np.random.uniform(-2.0, 2.0, size=6)
+@pytest.fixture
+def mujoco_data(mujoco_model):
+    """Create MuJoCo data instance."""
+    return mujoco.MjData(mujoco_model)
+
+
+@pytest.fixture
+def fk_function():
+    """Build CasADi FK function."""
+    return build_ur5e_fk_function()
+
+
+@pytest.fixture
+def ee_site_id(mujoco_model):
+    """Get end-effector site ID."""
+    try:
+        site_id = mujoco.mj_name2id(mujoco_model, mujoco.mjtObj.mjOBJ_SITE, "arm_hand_pinch")
+        if site_id < 0:
+            pytest.skip("End-effector site 'arm_hand_pinch' not found in model")
+        return site_id
+    except Exception:
+        pytest.skip("End-effector site 'arm_hand_pinch' not found in model")
+
+
+class TestForwardKinematics:
+    """Test suite for forward kinematics."""
+
+    def test_fk_zero_configuration(self, fk_function, mujoco_model, mujoco_data, ee_site_id):
+        """Test FK at zero configuration."""
+        if mujoco_model.nq < 6:
+            pytest.skip("Model has fewer than 6 DOFs (robot not loaded)")
         
-        # MuJoCo FK (direct)
-        data.qpos[:6] = q
-        mujoco.mj_forward(model, data)
-        ee_mujoco = data.site_xpos[site_id].copy()
+        q_test = np.zeros(6)
         
-        # FK Solver (should be identical)
-        ee_fk = fk_solver.compute_ee_position(q)
+        # Analytic FK
+        fk_pos = np.array(fk_function(q_test)).flatten()
         
-        # Error (should be numerical noise only)
-        error = np.linalg.norm(ee_fk - ee_mujoco)
-        errors.append(error)
+        # MuJoCo FK
+        mujoco_data.qpos[:6] = q_test
+        mujoco.mj_forward(mujoco_model, mujoco_data)
+        mujoco_pos = mujoco_data.site_xpos[ee_site_id].copy()
         
-        if error > max_error:
-            max_error = error
-            max_error_q = q.copy()
+        # Compare
+        error = np.linalg.norm(fk_pos - mujoco_pos)
+        print(f"\nZero config - Analytic FK: {fk_pos}")
+        print(f"Zero config - MuJoCo FK:   {mujoco_pos}")
+        print(f"Zero config - Error: {error:.6f} m")
         
-        # Print first 3 and any anomalies
-        if i < 3 or error > 1e-6:
-            print(f"Test {i+1}:")
-            print(f"  q = {q}")
-            print(f"  MuJoCo:  {ee_mujoco}")
-            print(f"  FKSolver: {ee_fk}")
-            print(f"  Error: {error*1e6:.2f} µm (micrometers)")
-            print()
-    
-    errors = np.array(errors)
-    
-    print("=" * 70)
-    print("RESULTS:")
-    print("=" * 70)
-    print(f"Tests run:    {n_tests}")
-    print(f"Mean error:   {errors.mean()*1e6:.3f} µm")
-    print(f"Median error: {np.median(errors)*1e6:.3f} µm")
-    print(f"Max error:    {max_error*1e6:.3f} µm")
-    print()
-    
-    # Since FKSolver uses MuJoCo, errors should be floating-point noise only
-    if max_error > 1e-3:  # 1mm
-        print("❌ FAILED: FK has unexpected discrepancy")
-        print(f"   Check FKSolver implementation!")
-        return False
-    else:
-        print("✅ PASSED: FK is consistent with MuJoCo")
-        print(f"   (as expected, since it uses MuJoCo internally)")
-        return True
+        # FK calibrated to match at zero config (should be near-perfect)
+        assert error < 0.005, f"FK error at zero config: {error:.6f} m"
 
+    def test_fk_random_configurations(self, fk_function, mujoco_model, mujoco_data, ee_site_id):
+        """Test FK at random configurations."""
+        if mujoco_model.nq < 6:
+            pytest.skip("Model has fewer than 6 DOFs (robot not loaded)")
+        
+        np.random.seed(42)
+        n_tests = 100
+        errors = []
+        
+        for i in range(n_tests):
+            # Random joint configuration
+            q_test = np.random.uniform(-np.pi, np.pi, 6)
+            
+            # Analytic FK
+            fk_pos = np.array(fk_function(q_test)).flatten()
+            
+            # MuJoCo FK
+            mujoco_data.qpos[:6] = q_test
+            mujoco.mj_forward(mujoco_model, mujoco_data)
+            mujoco_pos = mujoco_data.site_xpos[ee_site_id].copy()
+            
+            # Compute error
+            error = np.linalg.norm(fk_pos - mujoco_pos)
+            errors.append(error)
+            
+            if i < 5:  # Print first 5
+                print(f"\nTest {i+1} - q: {q_test}")
+                print(f"Test {i+1} - Analytic FK: {fk_pos}")
+                print(f"Test {i+1} - MuJoCo FK:   {mujoco_pos}")
+                print(f"Test {i+1} - Error: {error:.6f} m")
+        
+        errors = np.array(errors)
+        print(f"\n=== Random Configuration Tests (n={n_tests}) ===")
+        print(f"Mean error:   {np.mean(errors):.6f} m")
+        print(f"Median error: {np.median(errors):.6f} m")
+        print(f"Max error:    {np.max(errors):.6f} m")
+        print(f"Min error:    {np.min(errors):.6f} m")
+        print(f"Std dev:      {np.std(errors):.6f} m")
+        
+        # FK should match MuJoCo at the pinch point to within a few millimeters
+        assert np.mean(errors) < 0.005, f"Mean FK error too large: {np.mean(errors):.6f} m"
+        assert np.max(errors) < 0.010, f"Max FK error too large: {np.max(errors):.6f} m"
+        assert np.std(errors) < 0.003, f"FK errors too variable: {np.std(errors):.6f} m"
 
-def test_fk_multi_link():
-    """Test FK for all links (shoulder, elbow, wrist, EE)."""
-    print("\n" + "=" * 70)
-    print("MULTI-LINK FK TEST")
-    print("=" * 70)
-    
-    model, data = load_ur5e_model()
-    fk_solver = FKSolver(model=model, site_name="arm_hand_pinch")
-    
-    # Test configuration
-    q = np.array([0.5, -1.0, 1.5, -0.5, -1.5, 0.0])
-    
-    data.qpos[:6] = q
-    mujoco.mj_forward(model, data)
-    
-    # Get MuJoCo positions for link bodies (must match LinkNames defaults in FKSolver)
-    link_names = {
-        'shoulder': 'arm_shoulder_link',
-        'elbow': 'arm_forearm_link',
-        'wrist': 'arm_wrist_3_link',  # Default in FKSolver
-    }
-    
-    print(f"Joint config: {q}")
-    print()
-    
-    all_good = True
-    for link_key, body_name in link_names.items():
-        try:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            pos_mujoco = data.xpos[body_id].copy()
+    def test_fk_workspace_corners(self, fk_function, mujoco_model, mujoco_data, ee_site_id):
+        """Test FK at typical workspace positions."""
+        if mujoco_model.nq < 6:
+            pytest.skip("Model has fewer than 6 DOFs (robot not loaded)")
+        
+        # Common UR5e configurations
+        test_configs = [
+            np.array([0, -np.pi/2, 0, -np.pi/2, 0, 0]),  # Home position
+            np.array([np.pi/4, -np.pi/3, np.pi/4, -np.pi/2, 0, 0]),  # Front right
+            np.array([-np.pi/4, -np.pi/3, np.pi/4, -np.pi/2, 0, 0]),  # Front left
+            np.array([np.pi, -np.pi/4, -np.pi/4, -3*np.pi/4, 0, 0]),  # Back
+            np.array([0, -np.pi/6, np.pi/3, -np.pi/2, np.pi/2, 0]),  # Overhead
+        ]
+        
+        config_names = ["Home", "Front Right", "Front Left", "Back", "Overhead"]
+        
+        for i, (q_test, name) in enumerate(zip(test_configs, config_names)):
+            # Analytic FK
+            fk_pos = np.array(fk_function(q_test)).flatten()
             
-            # Get analytical FK
-            if link_key == 'shoulder':
-                pos_analytical = fk_solver.compute_shoulder_position(q)
-            elif link_key == 'elbow':
-                pos_analytical = fk_solver.compute_elbow_position(q)
-            elif link_key == 'wrist':
-                pos_analytical = fk_solver.compute_wrist_position(q)
+            # MuJoCo FK
+            mujoco_data.qpos[:6] = q_test
+            mujoco.mj_forward(mujoco_model, mujoco_data)
+            mujoco_pos = mujoco_data.site_xpos[ee_site_id].copy()
             
-            error = np.linalg.norm(pos_analytical - pos_mujoco)
+            # Compute error
+            error = np.linalg.norm(fk_pos - mujoco_pos)
             
-            print(f"{link_key}:")
-            print(f"  MuJoCo:    {pos_mujoco}")
-            print(f"  FKSolver:  {pos_analytical}")
-            print(f"  Error: {error*1e6:.2f} µm")
+            print(f"\n{name} - Analytic FK: {fk_pos}")
+            print(f"{name} - MuJoCo FK:   {mujoco_pos}")
+            print(f"{name} - Error: {error:.6f} m")
             
-            if error > 1e-3:  # 1mm
-                print(f"  ❌ Unexpected error!")
-                all_good = False
-            else:
-                print(f"  ✅ Good (< 1mm)")
-            print()
-            
-        except Exception as e:
-            print(f"{link_key}: ⚠️  Could not test ({e})")
-            all_good = False
-    
-    return all_good
+            # FK should be accurate at typical workspace configurations (few mm)
+            assert error < 0.010, f"FK error at {name}: {error:.6f} m"
 
+    def test_fk_joint_limits(self, fk_function, mujoco_model, mujoco_data, ee_site_id):
+        """Test FK at joint limits."""
+        if mujoco_model.nq < 6:
+            pytest.skip("Model has fewer than 6 DOFs (robot not loaded)")
+        
+        # Test near limits (avoiding singularities)
+        limit_configs = [
+            np.array([np.pi, 0, 0, 0, 0, 0]),
+            np.array([-np.pi, 0, 0, 0, 0, 0]),
+            np.array([0, -np.pi, 0, 0, 0, 0]),
+            np.array([0, 0, np.pi, 0, 0, 0]),
+        ]
+        
+        for i, q_test in enumerate(limit_configs):
+            # Analytic FK
+            fk_pos = np.array(fk_function(q_test)).flatten()
+            
+            # MuJoCo FK
+            mujoco_data.qpos[:6] = q_test
+            mujoco.mj_forward(mujoco_model, mujoco_data)
+            mujoco_pos = mujoco_data.site_xpos[ee_site_id].copy()
+            
+            # Compute error
+            error = np.linalg.norm(fk_pos - mujoco_pos)
+            
+            print(f"\nLimit config {i+1} - q: {q_test}")
+            print(f"Limit config {i+1} - Analytic FK: {fk_pos}")
+            print(f"Limit config {i+1} - MuJoCo FK:   {mujoco_pos}")
+            print(f"Limit config {i+1} - Error: {error:.6f} m")
+            
+            assert error < 0.010, f"FK error at limit config {i+1}: {error:.6f} m"
 
-def test_fk_home_position():
-    """Test FK at home position (all joints = 0)."""
-    print("=" * 70)
-    print("FK HOME POSITION TEST")
-    print("=" * 70)
-    
-    model, data = load_ur5e_model()
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "arm_hand_pinch")
-    fk_solver = FKSolver(model=model, site_name="arm_hand_pinch")
-    
-    q_home = np.zeros(6)
-    
-    # MuJoCo FK
-    data.qpos[:6] = q_home
-    mujoco.mj_forward(model, data)
-    ee_mujoco = data.site_xpos[site_id].copy()
-    
-    # FKSolver
-    ee_fk = fk_solver.compute_ee_position(q_home)
-    
-    error = np.linalg.norm(ee_fk - ee_mujoco)
-    
-    print(f"Home position (all joints = 0):")
-    print(f"  MuJoCo:  {ee_mujoco}")
-    print(f"  FKSolver: {ee_fk}")
-    print(f"  Error: {error*1e6:.3f} µm")
-    print()
-    
-    if error < 1e-6:
-        print("✅ PASSED: FK is identical to MuJoCo (as expected)")
-        return True
-    else:
-        print("⚠️  Warning: Small numerical difference detected")
-        return error < 1e-3  # Still pass if < 1mm
+    def test_fk_output_shape(self, fk_function):
+        """Test that FK returns correct output shape."""
+        q_test = np.zeros(6)
+        result = np.array(fk_function(q_test))
+        
+        assert result.shape == (3, 1) or result.shape == (3,), \
+            f"FK should return 3D position, got shape {result.shape}"
+
+    def test_fk_casadi_symbolic(self):
+        """Test that FK function is CasADi symbolic."""
+        import casadi as ca
+        
+        fk_fun = build_ur5e_fk_function()
+        
+        # Create symbolic input
+        q_sym = ca.SX.sym("q", 6)
+        result = fk_fun(q_sym)
+        
+        # Should be symbolic expression
+        assert isinstance(result, ca.SX), "FK should work with symbolic CasADi variables"
+        
+        # Should be able to take jacobian (for MPC gradients)
+        jac = ca.jacobian(result, q_sym)
+        assert jac.shape == (3, 6), f"Jacobian should be 3x6, got {jac.shape}"
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 70)
-    print("FORWARD KINEMATICS TEST SUITE")
-    print("=" * 70)
-    print()
-    
-    results = []
-    
-    # Run all tests
-    results.append(("Home Position", test_fk_home_position()))
-    results.append(("Consistency (100 random configs)", test_fk_accuracy()))
-    results.append(("Multi-link FK", test_fk_multi_link()))
-    
-    # Summary
-    print("\n" + "=" * 70)
-    print("TEST SUMMARY")
-    print("=" * 70)
-    
-    for test_name, passed in results:
-        status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"{status}: {test_name}")
-    
-    all_passed = all(result[1] for result in results)
-    
-    print()
-    if all_passed:
-        print("🎉 ALL TESTS PASSED!")
-        print("FK implementation is ready for MPC")
-    else:
-        print("⚠️  SOME TESTS FAILED")
-        print("FK implementation needs fixes before using in MPC")
-    
-    print("=" * 70)
-    
-    sys.exit(0 if all_passed else 1)
-
+    pytest.main([__file__, "-v", "-s"])

@@ -7,20 +7,17 @@ dependencies = [
     # Simulation
     "mujoco==3.3.6",
     "loop-rate-limiters==1.2.0",
-    
     # Core scientific computing
     "numpy>=1.24.0",
     "scipy>=1.10.0",
-    
     # Optimization (for MPC)
     "casadi>=3.6.0",
-    
     # Machine Learning (for imitation learning)
     "torch>=2.0.0",
     "matplotlib>=3.7.0",
-    
     # Configuration and utilities
     "pyyaml>=6.0",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +31,12 @@ hardware = [
 vision = [
     "ultralytics>=8.0.0",
     "opencv-python>=4.8.0",
+]
+
+# Development and testing dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
 [build-system]

@@ -1,6 +1,6 @@
 """
 Model Predictive Control (MPC) Controller
-Position-space MPC for position-controlled robots, with NN-based FK
+Position-space MPC for position-controlled robots, with analytic FK
 and hard obstacle constraints at the end-effector.
 """
 
@@ -11,15 +11,14 @@ from pathlib import Path
 
 
 class MPCController:
-    """MPC controller for a position-controlled robotic arm with NN FK obstacle avoidance."""
+    """MPC controller for a position-controlled robotic arm with analytic FK obstacle avoidance."""
 
     def __init__(
         self,
         n_joints: int = 6,
         horizon: int = 30,
         dt: float = 0.05,
-        nn_fk_weights_path=None,
-        enable_nn_fk: bool = True,
+        enable_fk: bool = True,
     ):
         """
         Initialize MPC controller.
@@ -28,14 +27,12 @@ class MPCController:
             n_joints: number of robot joints.
             horizon: prediction horizon (number of steps).
             dt: time step [s]; should match outer control loop period.
-            nn_fk_weights_path: path to NN FK weights (.npz). If None, defaults to
-                data/models/ur5e_fk_nn.npz relative to repo root.
-            enable_nn_fk: whether to actually use the NN FK inside the MPC.
+            enable_fk: whether to use the analytic FK inside the MPC.
         """
         self.n_joints = n_joints
         self.horizon = horizon
         self.dt = dt
-        self.enable_nn_fk = enable_nn_fk
+        self.enable_fk = enable_fk
 
         # Cost weights (joint-space tracking + smoothness)
         self.Q = np.eye(n_joints) * 500.0
@@ -62,33 +59,18 @@ class MPCController:
         # Bodies along the arm for MuJoCo-based geometric checks
         self.link_body_ids = []
 
-        # Neural network FK (EE position only)
-        self.nn_fk_fun = None
-        if nn_fk_weights_path is None:
-            nn_fk_weights_path = (
-                Path(__file__).parent.parent.parent
-                / "data"
-                / "models"
-                / "ur5e_fk_nn.npz"
-            )
-
-        nn_fk_weights_path = Path(nn_fk_weights_path)
-        if nn_fk_weights_path.exists() and self.enable_nn_fk:
-            from src.control.nn_fk_casadi import build_nn_fk_function
-
-            self.nn_fk_fun = build_nn_fk_function(str(nn_fk_weights_path), n_joints)
-            print(f"✓ Loaded NN FK from {nn_fk_weights_path} (enabled in MPC)")
-        elif nn_fk_weights_path.exists():
-            print(
-                f"✓ NN FK weights found at {nn_fk_weights_path}, "
-                f"but NN-based MPC is disabled (enable_nn_fk=False)."
-            )
+        # Analytic FK (UR5e)
+        self.fk_fun = None
+        if self.enable_fk:
+            try:
+                from src.control.forward_kinematics import build_ur5e_fk_function
+                self.fk_fun = build_ur5e_fk_function()
+                print("✓ Using analytic UR5e FK (CasADi) inside MPC.")
+            except Exception as e:
+                print(f"⚠ Failed to build analytic UR5e FK: {e}")
+                print("  MPC obstacle avoidance will fall back to MuJoCo-only heuristics.")
         else:
-            print(f"⚠ NN FK weights not found at {nn_fk_weights_path}")
-            print("  MPC obstacle avoidance will fall back to MuJoCo-only heuristics.")
-            print("  To enable NN-based FK, run:")
-            print("    1. python scripts/generate_fk_dataset.py")
-            print("    2. python scripts/train_nn_fk.py")
+            print("Analytic FK disabled in MPC (enable_fk=False).")
 
         # CasADi solver & cached bounds
         self.solver = None
@@ -104,7 +86,7 @@ class MPCController:
         Initialize which robot bodies (links) are used for collision checks.
 
         We try a set of common UR5e link names with the "arm_" prefix.
-        If no matches are found, we fall back to EE-only checks.
+        If no matches are found, we fall back to auto-detection or EE-only checks.
         """
         if self.link_body_ids:
             return  # already initialized
@@ -129,13 +111,22 @@ class MPCController:
             except Exception:
                 continue
 
+        # Fallback: try to auto-detect any bodies containing "arm" or "wrist"
+        if not self.link_body_ids:
+            for bid in range(model.nbody):
+                name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, bid)
+                if name is None:
+                    continue
+                if any(tok in name for tok in ["arm", "wrist", "shoulder", "forearm"]):
+                    self.link_body_ids.append(bid)
+
         if self.link_body_ids:
             print(
                 f"✓ MPC collision checks will use {len(self.link_body_ids)} arm link bodies."
             )
         else:
             print(
-                "⚠ MPC collision checks: no arm link bodies found by name; "
+                "⚠ MPC collision checks: no arm link bodies found; "
                 "falling back to EE-only checks."
             )
 
@@ -239,11 +230,11 @@ class MPCController:
         # -----------------------------
         # Obstacle constraints + margin cost
         # -----------------------------
-        if self.nn_fk_fun is not None and self.enable_nn_fk:
-            print("  Using NN FK for EE obstacle constraints + margin cost")
+        if self.fk_fun is not None and self.enable_fk:
+            print("  Using analytic FK for EE obstacle constraints + margin cost")
             for k in range(H + 1):
-                # EE position from NN (3x1)
-                ee_pos_k = self.nn_fk_fun(q[:, k])
+                # EE position from FK (3x1)
+                ee_pos_k = self.fk_fun(q[:, k])
 
                 for i_obs in range(self.n_max_obstacles):
                     center = obs_pos[:, i_obs]    # (3,)
@@ -280,7 +271,7 @@ class MPCController:
 
                     cost += active_mask * self.obstacle_weight * pen_mag ** 2
         else:
-            print("  NN FK NOT used in MPC; no analytic EE constraints (MuJoCo heuristics only).")
+            print("  Analytic FK NOT used in MPC; no analytic EE constraints (MuJoCo heuristics only).")
 
         # -----------------------------
         # Variable bounds (joint limits)
@@ -330,7 +321,7 @@ class MPCController:
         print(
             f"✓ MPC initialized: {self.n_joints} joints, horizon={self.horizon}, dt={self.dt}"
         )
-        if self.nn_fk_fun is not None and self.enable_nn_fk:
+        if self.fk_fun is not None and self.enable_fk:
             print("  Obstacle handling:")
             print("    • Hard constraint: EE outside obstacle box")
             print("    • Soft cost: EE outside box + safety margin")
