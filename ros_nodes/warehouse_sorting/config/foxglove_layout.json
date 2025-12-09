@@ -1,0 +1,94 @@
+{
+  "configById": {
+    "3D!1": {
+      "layers": {
+        "grid": {
+          "visible": true
+        }
+      },
+      "cameraState": {
+        "perspective": true,
+        "distance": 3.5,
+        "phi": 60,
+        "thetaOffset": 45,
+        "targetOffset": [0.0, -0.3, 0.5],
+        "target": [0.0, -0.3, 0.5],
+        "targetOrientation": [0, 0, 0, 1]
+      },
+      "followTf": "base_link",
+      "topics": {
+        "/visualization_markers": {
+          "visible": true
+        },
+        "/box_markers": {
+          "visible": true
+        },
+        "/mpc_trajectory_viz": {
+          "visible": true
+        },
+        "/robot_description": {
+          "visible": true
+        }
+      }
+    },
+    "Plot!1": {
+      "paths": [
+        {
+          "value": "/joint_states.position[0]",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/joint_states.position[1]",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        },
+        {
+          "value": "/joint_states.position[2]",
+          "enabled": true,
+          "timestampMethod": "receiveTime"
+        }
+      ],
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showPlotValuesInLegend": false,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 240
+    },
+    "RawMessages!1": {
+      "topicPath": "/task_status",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false
+    },
+    "StateTransitions!1": {
+      "topicPath": "/task_status",
+      "isSynced": true
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1.0
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": "3D!1",
+      "second": "Plot!1",
+      "splitPercentage": 70
+    },
+    "second": {
+      "direction": "column",
+      "first": "StateTransitions!1",
+      "second": "RawMessages!1",
+      "splitPercentage": 50
+    },
+    "splitPercentage": 65
+  }
+}

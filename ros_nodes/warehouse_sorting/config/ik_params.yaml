@@ -1,0 +1,7 @@
+# IK Solver Parameters
+ik_solver:
+  ros__parameters:
+    site_name: 'arm_hand_pinch'
+    max_iterations: 100
+    tolerance: 0.01      # meters
+    damping: 0.05        # Damped least squares regularization

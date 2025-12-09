@@ -1,0 +1,9 @@
+# IK solving service
+geometry_msgs/Pose target_pose
+bool use_orientation
+float64 tolerance
+int32 max_iterations
+---
+float64[] joint_angles
+bool success
+float64 error
