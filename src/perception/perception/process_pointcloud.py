@@ -21,7 +21,7 @@ class RealSensePCSubscriber(Node):
         self.declare_parameter('plane.b', 30.0)
         self.declare_parameter('plane.c', 0.2)
         self.declare_parameter('plane.d', -1.0)
-        self.declare_parameter('max_distance', 0.4)
+        self.declare_parameter('max_distance', 0.6)
 
         self.a = self.get_parameter('plane.a').value
         self.b = self.get_parameter('plane.b').value
