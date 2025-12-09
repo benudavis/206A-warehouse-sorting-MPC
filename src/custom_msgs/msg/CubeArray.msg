@@ -1,0 +1,2 @@
+# CubeArray.msg
+CubeMsg[] cubes
