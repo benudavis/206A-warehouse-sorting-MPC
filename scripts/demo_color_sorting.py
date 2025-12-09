@@ -37,6 +37,25 @@ MODELS_DIR = Path(__file__).parent.parent / "sim" / "models"
 BASE_SAFETY_MARGIN = 0.05   # robot empty-handed
 OBJECT_SAFETY_MARGIN = 0.08  # robot holding a box
 
+# Safe zones for pick and place operations
+# Boxes are around x=0.35-0.45, y=-0.28 to -0.42, z=0.52
+BOX_SAFE_ZONE = {
+    "center": [0.40, -0.35, 0.60],   # Center of box region, slightly above boxes
+    "half_size": [0.15, 0.15, 0.20],  # Encompasses all boxes with margin
+}
+
+# Baskets are at x=-0.45, y=-0.10 (red) and y=-0.60 (blue), z=0.48
+BASKET_SAFE_ZONE = {
+    "center": [-0.45, -0.35, 0.65],   # Center above both baskets
+    "half_size": [0.20, 0.35, 0.25],  # Covers area above both baskets
+}
+
+# Moving obstacle parameters
+OBSTACLE_X_MIN = -0.25   # Near basket safe zone edge
+OBSTACLE_X_MAX = 0.15    # Near box safe zone edge  
+OBSTACLE_PERIOD = 8.0    # Seconds for one full back-and-forth cycle
+OBSTACLE_BASE_POS = [-0.05, -0.35, 0.70]  # Base position (center of oscillation)
+
 # Box configurations
 BOXES = [
     # Red boxes → red basket
@@ -79,6 +98,64 @@ def quat_conj(q):
     """Conjugate of quaternion (w, x, y, z)."""
     w, x, y, z = q
     return np.array([w, -x, -y, -z], dtype=float)
+
+
+def is_in_safe_zone(pos, safe_zone):
+    """Check if a position is within a safe zone (axis-aligned box)."""
+    center = np.array(safe_zone["center"])
+    half_size = np.array(safe_zone["half_size"])
+    diff = np.abs(pos - center)
+    return np.all(diff <= half_size)
+
+
+def get_current_safe_zone(pos):
+    """Return the name of the safe zone the position is in, or None."""
+    if is_in_safe_zone(pos, BOX_SAFE_ZONE):
+        return "box"
+    if is_in_safe_zone(pos, BASKET_SAFE_ZONE):
+        return "basket"
+    return None
+
+
+def compute_obstacle_position(t):
+    """
+    Compute obstacle position at time t.
+    
+    The obstacle oscillates in the x direction using a sinusoidal motion.
+    Returns the full [x, y, z] position.
+    """
+    # Sinusoidal oscillation in x
+    x_amplitude = (OBSTACLE_X_MAX - OBSTACLE_X_MIN) / 2.0
+    x_center = (OBSTACLE_X_MAX + OBSTACLE_X_MIN) / 2.0
+    x = x_center + x_amplitude * np.sin(2.0 * np.pi * t / OBSTACLE_PERIOD)
+    
+    return np.array([x, OBSTACLE_BASE_POS[1], OBSTACLE_BASE_POS[2]], dtype=float)
+
+
+def update_moving_obstacle(model, data, t, mpc_controller=None, obstacle_mocap_ids=None):
+    """
+    Update the position of the moving obstacle and its visualizations.
+    Also updates the MPC obstacle position if provided.
+    
+    Args:
+        model: MuJoCo model
+        data: MuJoCo data
+        t: Current simulation time
+        mpc_controller: Optional MPC controller to update obstacle position
+        obstacle_mocap_ids: Dict with mocap IDs for obstacle and its visualizations
+    """
+    new_pos = compute_obstacle_position(t)
+    
+    # Update mocap positions
+    if obstacle_mocap_ids is not None:
+        for name, mocap_id in obstacle_mocap_ids.items():
+            if mocap_id >= 0:
+                data.mocap_pos[mocap_id] = new_pos
+    
+    # Update MPC obstacle
+    if mpc_controller is not None and len(mpc_controller.obstacles) > 0:
+        # Update the first (and only) obstacle position
+        mpc_controller.obstacles[0] = (new_pos.copy(), mpc_controller.obstacles[0][1])
 
 
 class FullscreenEnforcer:
@@ -174,25 +251,29 @@ def build_world():
         basket_safety_geom.contype = 0
         basket_safety_geom.conaffinity = 0
 
-    # Center wall obstacle
+    # Center wall obstacle (z shorter, y longer) - MOVING obstacle (mocap body)
     obstacle = scene.worldbody.add_body()
     obstacle.name = "obstacle_center_wall"
-    obstacle.pos = [-0.15, -0.35, 0.70]
+    obstacle.pos = OBSTACLE_BASE_POS
+    obstacle.mocap = True  # Make it a mocap body so we can move it
     obs_geom = obstacle.add_geom()
     obs_geom.type = mujoco.mjtGeom.mjGEOM_BOX
-    obs_geom.size = [0.01, 0.12, 0.08]  # thin wall
+    obs_geom.size = [0.01, 0.25, 0.04]  # thin wall: shorter z, longer y
     obs_geom.rgba = [0.9, 0.5, 0.1, 0.85]
+    obs_geom.contype = 0  # No collision (mocap bodies can't collide normally)
+    obs_geom.conaffinity = 0
 
-    # Safety margin visualizations for wall
+    # Safety margin visualizations for wall (also mocap to move with obstacle)
     safety_viz = scene.worldbody.add_body()
     safety_viz.name = "obstacle_safety_margin"
-    safety_viz.pos = [-0.15, -0.35, 0.70]
+    safety_viz.pos = OBSTACLE_BASE_POS
+    safety_viz.mocap = True
     safety_margin_geom = safety_viz.add_geom()
     safety_margin_geom.type = mujoco.mjtGeom.mjGEOM_BOX
     safety_margin_geom.size = [
         0.01 + BASE_SAFETY_MARGIN,
-        0.12 + BASE_SAFETY_MARGIN,
-        0.08 + BASE_SAFETY_MARGIN,
+        0.25 + BASE_SAFETY_MARGIN,
+        0.04 + BASE_SAFETY_MARGIN,
     ]
     safety_margin_geom.rgba = [1.0, 0.0, 0.0, 0.2]
     safety_margin_geom.contype = 0
@@ -200,17 +281,41 @@ def build_world():
 
     holding_margin_viz = scene.worldbody.add_body()
     holding_margin_viz.name = "obstacle_holding_margin"
-    holding_margin_viz.pos = [-0.15, -0.35, 0.70]
+    holding_margin_viz.pos = OBSTACLE_BASE_POS
+    holding_margin_viz.mocap = True
     holding_margin_geom = holding_margin_viz.add_geom()
     holding_margin_geom.type = mujoco.mjtGeom.mjGEOM_BOX
     holding_margin_geom.size = [
         0.01 + OBJECT_SAFETY_MARGIN,
-        0.12 + OBJECT_SAFETY_MARGIN,
-        0.08 + OBJECT_SAFETY_MARGIN,
+        0.25 + OBJECT_SAFETY_MARGIN,
+        0.04 + OBJECT_SAFETY_MARGIN,
     ]
     holding_margin_geom.rgba = [1.0, 1.0, 0.0, 0.12]
     holding_margin_geom.contype = 0
     holding_margin_geom.conaffinity = 0
+
+    # Safe zone visualizations (transparent boxes showing where pick/place can happen)
+    # Box safe zone (green)
+    box_zone_viz = scene.worldbody.add_body()
+    box_zone_viz.name = "box_safe_zone"
+    box_zone_viz.pos = BOX_SAFE_ZONE["center"]
+    box_zone_geom = box_zone_viz.add_geom()
+    box_zone_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    box_zone_geom.size = BOX_SAFE_ZONE["half_size"]
+    box_zone_geom.rgba = [0.0, 0.8, 0.0, 0.08]  # Green, very transparent
+    box_zone_geom.contype = 0
+    box_zone_geom.conaffinity = 0
+
+    # Basket safe zone (cyan)
+    basket_zone_viz = scene.worldbody.add_body()
+    basket_zone_viz.name = "basket_safe_zone"
+    basket_zone_viz.pos = BASKET_SAFE_ZONE["center"]
+    basket_zone_geom = basket_zone_viz.add_geom()
+    basket_zone_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    basket_zone_geom.size = BASKET_SAFE_ZONE["half_size"]
+    basket_zone_geom.rgba = [0.0, 0.8, 0.8, 0.08]  # Cyan, very transparent
+    basket_zone_geom.contype = 0
+    basket_zone_geom.conaffinity = 0
 
     # Boxes
     for cfg in BOXES:
@@ -629,8 +734,13 @@ def settle(model, data, steps=400):
         mujoco.mj_step(model, data)
 
 
-def step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook=None):
-    """Step simulation with welded box attachment."""
+def step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook=None,
+              sim_time=None, obstacle_mocap_ids=None, mpc_controller=None):
+    """Step simulation with welded box attachment and moving obstacle."""
+    # Update moving obstacle position
+    if sim_time is not None and obstacle_mocap_ids is not None:
+        update_moving_obstacle(model, data, sim_time, mpc_controller, obstacle_mocap_ids)
+    
     # Gripper command
     data.ctrl[6] = grip
 
@@ -659,6 +769,10 @@ def step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook=Non
         viewer.sync()
         if fullscreen_hook is not None:
             fullscreen_hook()
+    
+    # Return updated time
+    dt_step = 250 * model.opt.timestep
+    return (sim_time + dt_step) if sim_time is not None else None
 
 
 def move_to_waypoints(
@@ -677,14 +791,17 @@ def move_to_waypoints(
     obstacle_geom_ids=None,
     collision_log=None,
     viz_data=None,
+    sim_time=0.0,
+    obstacle_mocap_ids=None,
 ):
     """
     Move through multiple waypoints continuously.
     
     MPC plans toward the FINAL waypoint but executes smoothly through intermediate waypoints.
+    Returns updated simulation time.
     """
     if len(waypoints) == 0:
-        return
+        return sim_time
     
     final_target = np.asarray(waypoints[-1][:6], dtype=float)
     total_steps = len(waypoints) * steps_per_segment
@@ -729,7 +846,8 @@ def move_to_waypoints(
                 visualize_mpc_trajectory(viewer, model, viz_data, q_traj, site_id, data_main=data)
             
             data.ctrl[:6] = q_cmd
-            step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
+            sim_time = step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook,
+                                sim_time, obstacle_mocap_ids, mpc_controller)
             
             if obstacle_geom_ids is not None:
                 is_collision, bodies = check_collision(model, data, obstacle_geom_ids)
@@ -762,13 +880,16 @@ def move_to_waypoints(
                 alpha_smooth = alpha * alpha * (3.0 - 2.0 * alpha)
                 desired = (1.0 - alpha_smooth) * start + alpha_smooth * target
                 data.ctrl[:6] = desired
-                step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook)
+                sim_time = step_sim(model, data, attachment, site_id, grip, viewer, fullscreen_hook,
+                                    sim_time, obstacle_mocap_ids, mpc_controller)
                 
                 if diag and i % diag["interval"] == 0:
                     diag["logger"].log_state("box", phase, extra_data={"step": seg_idx * steps_per_segment + i})
     
     if original_margin is not None and mpc_controller is not None:
         mpc_controller.safety_margin = original_margin
+    
+    return sim_time
 
 
 def move_to(
@@ -787,12 +908,14 @@ def move_to(
     obstacle_geom_ids=None,
     collision_log=None,
     viz_data=None,
+    sim_time=0.0,
+    obstacle_mocap_ids=None,
 ):
-    """Single-target move (wrapper for backwards compatibility)."""
-    move_to_waypoints(
+    """Single-target move (wrapper for backwards compatibility). Returns updated sim_time."""
+    return move_to_waypoints(
         model, data, [target], steps, grip, attachment, site_id, viewer,
         diag, phase, fullscreen_hook, mpc_controller, obstacle_geom_ids,
-        collision_log, viz_data
+        collision_log, viz_data, sim_time, obstacle_mocap_ids
     )
 
 
@@ -814,9 +937,26 @@ def main():
     print("=" * 70)
     print("Layout: Boxes (center) → Wall (middle) → Baskets (left)")
     print("Red boxes → red basket | Blue boxes → blue basket")
+    print("-" * 70)
+    print("SAFE ZONES (pick/place operations only allowed in these regions):")
+    print(f"  Box zone:    center={BOX_SAFE_ZONE['center']}, half_size={BOX_SAFE_ZONE['half_size']}")
+    print(f"  Basket zone: center={BASKET_SAFE_ZONE['center']}, half_size={BASKET_SAFE_ZONE['half_size']}")
     print("=" * 70)
 
     model, data = build_world()
+
+    # Get mocap IDs for moving obstacle and its visualizations
+    obstacle_mocap_ids = {}
+    for name in ["obstacle_center_wall", "obstacle_safety_margin", "obstacle_holding_margin"]:
+        try:
+            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if body_id >= 0:
+                mocap_id = model.body_mocapid[body_id]
+                obstacle_mocap_ids[name] = mocap_id
+        except Exception:
+            pass
+    print(f"\nMoving obstacle mocap IDs: {obstacle_mocap_ids}")
+    print(f"Obstacle oscillates in x from {OBSTACLE_X_MIN:.2f} to {OBSTACLE_X_MAX:.2f} with period {OBSTACLE_PERIOD:.1f}s")
 
     # Rotate shoulder to face the scene
     shoulder_joint = model.jnt("arm_shoulder_pan_joint")
@@ -824,8 +964,12 @@ def main():
     model.key_ctrl[0][shoulder_joint.dofadr] += np.pi
     mujoco.mj_resetDataKeyframe(model, data, 0)
 
+    # Simulation time tracking
+    sim_time = 0.0
+
     # Let everything settle
     settle(model, data, steps=500)
+    sim_time += 500 * model.opt.timestep * 250  # Approximate time for settle
 
     # IK for end-effector
     ik = IKSolver(model, data, site_name=EE_SITE)
@@ -975,6 +1119,13 @@ def main():
             print(f"  ⚠️  Box {box_name} fell off table (z={box_pos[2]:.3f}), skipping.")
             continue
 
+        # Check if box is in the box safe zone (required for picking)
+        if not is_in_safe_zone(box_pos, BOX_SAFE_ZONE):
+            print(f"  ⚠️  Box {box_name} is outside box safe zone, skipping.")
+            print(f"      Box pos: {box_pos}")
+            print(f"      Safe zone center: {BOX_SAFE_ZONE['center']}, half_size: {BOX_SAFE_ZONE['half_size']}")
+            continue
+
         # Approach and contact poses
         above = box_pos.copy()
         above[2] += 0.12
@@ -998,11 +1149,12 @@ def main():
         # Make sure gripper is open
         print("Opening gripper...")
         for _ in range(50):
-            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
+            sim_time = step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook,
+                                sim_time=sim_time, obstacle_mocap_ids=obstacle_mocap_ids, mpc_controller=mpc_controller)
 
         # Move above box (no MPC, direct)
         print("Approaching above box...")
-        move_to(
+        sim_time = move_to(
             model,
             data,
             above_joints[:6],
@@ -1018,11 +1170,13 @@ def main():
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
+            sim_time=sim_time,
+            obstacle_mocap_ids=obstacle_mocap_ids,
         )
 
         # Lower to contact (no MPC, precise)
         print("Lowering to box...")
-        move_to(
+        sim_time = move_to(
             model,
             data,
             contact_joints[:6],
@@ -1038,11 +1192,14 @@ def main():
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
+            sim_time=sim_time,
+            obstacle_mocap_ids=obstacle_mocap_ids,
         )
 
         # Let physics settle
         for _ in range(50):
-            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
+            sim_time = step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook,
+                                sim_time=sim_time, obstacle_mocap_ids=obstacle_mocap_ids, mpc_controller=mpc_controller)
 
         # Check distance EE ↔ box COM
         GRASP_THRESH = 0.050
@@ -1061,7 +1218,7 @@ def main():
             )
             if success:
                 print("  Refining grasp pose...")
-                move_to(
+                sim_time = move_to(
                     model,
                     data,
                     refine_joints[:6],
@@ -1077,9 +1234,11 @@ def main():
                     obstacle_geom_ids=obstacle_geom_ids,
                     collision_log=collision_log,
                     viz_data=viz_data,
+                    sim_time=sim_time,
+                    obstacle_mocap_ids=obstacle_mocap_ids,
                 )
                 for _ in range(30):
-                    step_sim(
+                    sim_time = step_sim(
                         model,
                         data,
                         attachment,
@@ -1087,6 +1246,9 @@ def main():
                         grip=0,
                         viewer=viewer,
                         fullscreen_hook=fullscreen_hook,
+                        sim_time=sim_time,
+                        obstacle_mocap_ids=obstacle_mocap_ids,
+                        mpc_controller=mpc_controller,
                     )
                 grip_pos = data.site_xpos[site_id].copy()
                 box_now = data.xpos[box_body].copy()
@@ -1097,6 +1259,14 @@ def main():
 
         # Attach box if close enough
         if dist < GRASP_THRESH:
+            # Verify pick is happening in box safe zone
+            current_zone = get_current_safe_zone(grip_pos)
+            if current_zone != "box":
+                print(f"  ⚠️  Pick operation at {grip_pos} is outside box safe zone!")
+                print(f"      Current zone: {current_zone}")
+            else:
+                print(f"  ✓ Pick operation is within box safe zone")
+
             ee_body_id = model.site_bodyid[site_id]
             grip_quat = data.xquat[ee_body_id].copy()
             box_quat = data.xquat[box_body].copy()
@@ -1128,7 +1298,8 @@ def main():
         # Close gripper
         print("Closing gripper...")
         for i in range(150):
-            step_sim(model, data, attachment, site_id, grip=255, viewer=viewer, fullscreen_hook=fullscreen_hook)
+            sim_time = step_sim(model, data, attachment, site_id, grip=255, viewer=viewer, fullscreen_hook=fullscreen_hook,
+                                sim_time=sim_time, obstacle_mocap_ids=obstacle_mocap_ids, mpc_controller=mpc_controller)
             if diag and i % diag["interval"] == 0:
                 diag["logger"].log_state("box", "close", extra_data={"step": i})
 
@@ -1144,6 +1315,15 @@ def main():
         drop_margin = 0.005
         place_pos = basket_pos.copy()
         place_pos[2] = basket_top_z + box_size + drop_margin
+
+        # Check if placement position is in the basket safe zone
+        if not is_in_safe_zone(place_pos, BASKET_SAFE_ZONE):
+            print(f"  ⚠️  Basket placement position is outside basket safe zone!")
+            print(f"      Place pos: {place_pos}")
+            print(f"      Safe zone center: {BASKET_SAFE_ZONE['center']}, half_size: {BASKET_SAFE_ZONE['half_size']}")
+            # Adjust place position to be within safe zone if possible
+            # For now, we'll continue but warn the user
+            print(f"      Continuing anyway, but placement may be unsafe.")
 
         approach_ee = place_pos.copy()
         approach_ee[2] += 0.10
@@ -1163,7 +1343,7 @@ def main():
 
         # Transport with MPC (ONE continuous motion through waypoints)
         print(f"Transporting {box_name} → {box_color} basket...")
-        move_to_waypoints(
+        sim_time = move_to_waypoints(
             model,
             data,
             waypoints=[mid_clear_joints[:6], approach_joints[:6]],  # Two waypoints
@@ -1179,10 +1359,12 @@ def main():
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
+            sim_time=sim_time,
+            obstacle_mocap_ids=obstacle_mocap_ids,
         )
 
         # Precise lowering into basket (no MPC)
-        move_to(
+        sim_time = move_to(
             model,
             data,
             place_joints[:6],
@@ -1198,23 +1380,36 @@ def main():
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
+            sim_time=sim_time,
+            obstacle_mocap_ids=obstacle_mocap_ids,
         )
 
         # Release box
         print(f"Releasing into {box_color} basket...")
+        
+        # Verify release is happening in basket safe zone
+        release_pos = data.site_xpos[site_id].copy()
+        current_zone = get_current_safe_zone(release_pos)
+        if current_zone != "basket":
+            print(f"  ⚠️  Release operation at {release_pos} is outside basket safe zone!")
+            print(f"      Current zone: {current_zone}")
+        else:
+            print(f"  ✓ Release operation is within basket safe zone")
+        
         attachment["active"] = False
         attachment["qadr"] = -1
         attachment["dadr"] = -1
         attachment["body_id"] = -1
         attachment["q_rel"] = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         for i in range(200):
-            step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook)
+            sim_time = step_sim(model, data, attachment, site_id, grip=0, viewer=viewer, fullscreen_hook=fullscreen_hook,
+                                sim_time=sim_time, obstacle_mocap_ids=obstacle_mocap_ids, mpc_controller=mpc_controller)
             if diag and i % diag["interval"] == 0:
                 diag["logger"].log_state("box", "release", extra_data={"step": i})
 
         # Retreat with MPC (ONE continuous motion through waypoints)
         print("Retreating...")
-        move_to_waypoints(
+        sim_time = move_to_waypoints(
             model,
             data,
             waypoints=[approach_joints[:6], mid_clear_joints[:6]],  # Back through waypoints
@@ -1230,11 +1425,13 @@ def main():
             obstacle_geom_ids=obstacle_geom_ids,
             collision_log=collision_log,
             viz_data=viz_data,
+            sim_time=sim_time,
+            obstacle_mocap_ids=obstacle_mocap_ids,
         )
 
     # Return home using MPC
     print("\nReturning to home position...")
-    move_to(
+    sim_time = move_to(
         model,
         data,
         home_joints,
@@ -1250,6 +1447,8 @@ def main():
         obstacle_geom_ids=obstacle_geom_ids,
         collision_log=collision_log,
         viz_data=viz_data,
+        sim_time=sim_time,
+        obstacle_mocap_ids=obstacle_mocap_ids,
     )
 
     # Summary
@@ -1290,9 +1489,13 @@ def main():
 
     if viewer is not None:
         print("\nClose viewer to exit...")
+        print(f"(Obstacle continues to move - watch it oscillate!)")
         try:
             while viewer.is_running():
+                # Keep updating obstacle position
+                update_moving_obstacle(model, data, sim_time, mpc_controller, obstacle_mocap_ids)
                 mujoco.mj_step(model, data, nstep=250)
+                sim_time += 250 * model.opt.timestep
                 viewer.sync()
         except KeyboardInterrupt:
             pass

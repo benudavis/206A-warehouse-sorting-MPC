@@ -29,8 +29,6 @@ setup(
             'ik_solver = warehouse_sorting.ik_solver_node:main',
             'gripper_controller = warehouse_sorting.gripper_controller_node:main',
             'task_planner = warehouse_sorting.task_planner_node:main',
-            'visualization = warehouse_sorting.visualization_node:main',
-            'box_publisher_node.py = warehouse_sorting.box_publisher_node:main',
         ],
     },
 )

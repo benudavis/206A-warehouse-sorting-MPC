@@ -2,48 +2,31 @@
 """
 Task Planner Node - Complete Pick & Place Automation
 
-Implements full pick-place cycle for warehouse sorting:
+Implements full pick-place cycle for warehouse sorting using MoveIt IK:
 - Red boxes → red basket
 - Blue boxes → blue basket
-- Avoids wall obstacle
+- Uses MoveIt services for IK and planning (like the working example)
 """
 
-import sys
-from pathlib import Path
-from enum import Enum
 import numpy as np
 import time
+import threading
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.action import FollowJointTrajectory
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from moveit_msgs.srv import GetPositionIK, GetMotionPlan
+from moveit_msgs.msg import PositionIKRequest, Constraints, JointConstraint
+from geometry_msgs.msg import PoseStamped
 from builtin_interfaces.msg import Duration
-
-# Add project root to path
-sys.path.insert(0, '/ros2_ws/src_project')
-
-from control.inverse_kinematics import IKSolver
-import mujoco
-
-
-class TaskState(Enum):
-    """Task states for pick-and-place."""
-    IDLE = 0
-    MOVING_TO_BOX = 1
-    LOWERING = 2
-    GRASPING = 3
-    LIFTING = 4
-    MOVING_TO_BASKET = 5
-    PLACING = 6
-    RETURNING_HOME = 7
 
 
 class TaskPlannerNode(Node):
-    """Automated pick-and-place task sequencer."""
+    """Automated pick-and-place task sequencer using MoveIt."""
 
     def __init__(self):
         super().__init__('task_planner')
@@ -68,19 +51,23 @@ class TaskPlannerNode(Node):
             '/scaled_joint_trajectory_controller/follow_joint_trajectory'
         )
         
+        # Gripper service client
+        self.gripper_cli = self.create_client(Trigger, '/toggle_gripper')
+        
         # State
-        self.current_joints = np.zeros(6)
-        self.current_state = TaskState.IDLE
+        self.joint_state = None
+        self.job_queue = []  # Queue of JointState or 'toggle_grip'
+        self.current_box_name = None
         
         # Subscribe to joint states
         self.joint_sub = self.create_subscription(
             JointState,
             '/joint_states',
-            self.joint_callback,
+            self.joint_state_callback,
             10
         )
         
-        # Box definitions (from demo)
+        # Box definitions
         self.boxes = [
             {"name": "red_1", "pos": [0.35, -0.28, 0.52], "size": 0.030, "color": "red"},
             {"name": "red_2", "pos": [0.40, -0.32, 0.52], "size": 0.028, "color": "red"},
@@ -96,62 +83,42 @@ class TaskPlannerNode(Node):
             "blue": [-0.45, -0.60, 0.48],
         }
         
-        # Setup IK solver (using MuJoCo model for IK only)
-        self.setup_ik_solver()
+        # MoveIt service clients
+        self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
+        self.plan_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
         
-        # Home position
-        self.home_joints = np.array([0.0, -1.57, 1.57, -1.57, -1.57, 0.0])
+        # Wait for services
+        for srv, name in [(self.ik_client, 'compute_ik'),
+                          (self.plan_client, 'plan_kinematic_path')]:
+            while not srv.wait_for_service(timeout_sec=1.0):
+                self.get_logger().info(f'Waiting for /{name} service...')
         
         # Start automation after delay
         self.create_timer(5.0, self.start_automation)
         
         self.get_logger().info('✓ Task Planner ready - will start automation in 5 seconds')
 
-    def setup_ik_solver(self):
-        """Initialize IK solver with MuJoCo model."""
-        try:
-            # Build MuJoCo model for IK
-            models_dir = Path("/ros2_ws/sim/models")
-            scene = mujoco.MjSpec.from_file(str(models_dir / "scene.xml"))
-            arm_spec = mujoco.MjSpec.from_file(str(models_dir / "universal_robots_ur5e" / "ur5e.xml"))
-            hand_spec = mujoco.MjSpec.from_file(str(models_dir / "robotiq_2f85" / "2f85.xml"))
-            
-            # Attach
-            arm_spec.site("attachment_site").attach_body(hand_spec.worldbody, "hand_", "")
-            scene.site("robot_site").attach_body(arm_spec.worldbody, "arm_", "")
-            
-            # Compile
-            model = scene.compile()
-            data = mujoco.MjData(model)
-            
-            # Initialize IK solver
-            self.ik_solver = IKSolver(model, data, site_name="arm_hand_pinch")
-            self.mujoco_model = model
-            self.mujoco_data = data
-            
-            self.get_logger().info('✓ IK solver initialized')
-            
-        except Exception as e:
-            self.get_logger().error(f'Failed to initialize IK solver: {e}')
-            self.ik_solver = None
-
-    def joint_callback(self, msg):
-        """Update current joint positions."""
+    def joint_state_callback(self, msg):
+        """Update current joint state."""
         if len(msg.position) >= 6:
-            self.current_joints = np.array(msg.position[:6])
+            self.joint_state = msg
 
     def start_automation(self):
         """Start the automated pick-place sequence."""
+        if self.joint_state is None:
+            self.get_logger().warn("No joint state yet, waiting...")
+            return
+        
         self.get_logger().info('🚀 Starting automated pick-and-place sequence!')
         
         # Run automation in a thread to avoid blocking
-        import threading
         thread = threading.Thread(target=self.run_pick_place_sequence)
         thread.daemon = True
         thread.start()
 
     def run_pick_place_sequence(self):
-        """Main pick-place automation loop."""
+        """Main pick-place automation loop - builds job queue and executes."""
+        time.sleep(2)  # Let system stabilize
         
         # Process each box
         for idx, box in enumerate(self.boxes):
@@ -161,156 +128,249 @@ class TaskPlannerNode(Node):
             box_size = box["size"]
             basket_pos = np.array(self.baskets[box_color])
             
+            self.current_box_name = box_name
+            
             self.get_logger().info(f'\n{"="*60}')
             self.get_logger().info(f'[{idx+1}/{len(self.boxes)}] {box_name} ({box_color}) → {box_color} basket')
             self.get_logger().info(f'{"="*60}')
             
-            # 1. Move above box
-            self.get_logger().info(f'  Step 1: Moving above {box_name}...')
-            above_pos = box_pos.copy()
-            above_pos[2] += 0.15  # 15cm above box
+            # Build job queue for this box
+            self.job_queue = []
             
-            above_joints = self.solve_ik(above_pos)
-            if above_joints is not None:
-                self.move_to_joints(above_joints, duration=3.0)
-                time.sleep(3.5)
+            # 1. Move above box (pre-grasp)
+            cx, cy, cz = box_pos
+            pre_x = cx + 0.0
+            pre_y = cy - 0.035  # Offset like in working example
+            pre_z = cz + 0.185  # ~18.5cm above
             
-            # 2. Lower to grasp
-            self.get_logger().info(f'  Step 2: Lowering to grasp...')
-            grasp_pos = box_pos.copy()
-            grasp_pos[2] = box_pos[2] + box_size * 0.5 - 0.005
+            self.get_logger().info(f'  Step 1: Computing IK for pre-grasp above {box_name}...')
+            pre_grasp_js = self.compute_ik(self.joint_state, pre_x, pre_y, pre_z)
+            if pre_grasp_js is None:
+                self.get_logger().error(f"IK failed for pre-grasp pose of {box_name}")
+                continue
+            self.job_queue.append(pre_grasp_js)
             
-            grasp_joints = self.solve_ik(grasp_pos)
-            if grasp_joints is not None:
-                self.move_to_joints(grasp_joints, duration=2.0)
-                time.sleep(2.5)
+            # 2. Lower to grasp position
+            grasp_x = cx + 0.0
+            grasp_y = cy - 0.035
+            grasp_z = cz + 0.16  # DO NOT CHANGE lower than +0.16 (from working example)
             
-            # 3. Grasp box
-            self.get_logger().info(f'  Step 3: Grasping {box_name}...')
-            self.publish_gripper_event(f'grasp:{box_name}')
-            time.sleep(0.5)
+            self.get_logger().info(f'  Step 2: Computing IK for grasp position...')
+            grasp_js = self.compute_ik(self.joint_state, grasp_x, grasp_y, grasp_z)
+            if grasp_js is None:
+                self.get_logger().error(f"IK failed for grasp pose of {box_name}")
+                continue
+            self.job_queue.append(grasp_js)
             
-            # 4. Lift
-            self.get_logger().info(f'  Step 4: Lifting...')
-            lift_pos = grasp_pos.copy()
-            lift_pos[2] += 0.15
+            # 3. Close gripper
+            self.job_queue.append('toggle_grip')
             
-            lift_joints = self.solve_ik(lift_pos)
-            if lift_joints is not None:
-                self.move_to_joints(lift_joints, duration=2.0)
-                time.sleep(2.5)
+            # 4. Lift back to pre-grasp
+            self.job_queue.append(pre_grasp_js)
             
-            # 5. Move to basket (via safe waypoint to avoid wall)
-            self.get_logger().info(f'  Step 5: Moving to {box_color} basket...')
+            # 5. Move to basket (above release position)
+            rel_x = basket_pos[0] + 0.0
+            rel_y = basket_pos[1] - 0.035
+            rel_z = basket_pos[2] + 0.185
             
-            # Waypoint above basket
-            above_basket = basket_pos.copy()
-            above_basket[2] += 0.20
+            self.get_logger().info(f'  Step 5: Computing IK for release position...')
+            release_js = self.compute_ik(self.joint_state, rel_x, rel_y, rel_z)
+            if release_js is None:
+                self.get_logger().error(f"IK failed for release pose of {box_name}")
+                continue
+            self.job_queue.append(release_js)
             
-            waypoint_joints = self.solve_ik(above_basket)
-            if waypoint_joints is not None:
-                self.move_to_joints(waypoint_joints, duration=4.0)
-                time.sleep(4.5)
+            # 6. Release gripper
+            self.job_queue.append('toggle_grip')
             
-            # 6. Lower to place
-            self.get_logger().info(f'  Step 6: Placing in basket...')
-            place_pos = basket_pos.copy()
-            place_pos[2] += 0.05  # Just above basket
-            
-            place_joints = self.solve_ik(place_pos)
-            if place_joints is not None:
-                self.move_to_joints(place_joints, duration=2.0)
-                time.sleep(2.5)
-            
-            # 7. Release
-            self.get_logger().info(f'  Step 7: Releasing...')
-            self.publish_gripper_event(f'release:{box_name}:{box_color}_basket')
-            time.sleep(0.5)
-            
-            # 8. Lift away
-            self.get_logger().info(f'  Step 8: Retracting...')
-            if waypoint_joints is not None:
-                self.move_to_joints(waypoint_joints, duration=2.0)
-                time.sleep(2.5)
+            # Execute the job queue for this box
+            self.execute_jobs()
             
             self.get_logger().info(f'✓ {box_name} placed in {box_color} basket!')
         
-        # Return home
-        self.get_logger().info('\n🏠 Returning home...')
-        self.move_to_joints(self.home_joints, duration=4.0)
-        time.sleep(4.5)
-        
         self.get_logger().info('\n🎉 ALL BOXES SORTED! Demo complete.')
 
-    def solve_ik(self, target_pos, target_quat=None):
-        """Solve IK for target position."""
-        if self.ik_solver is None:
-            self.get_logger().error('IK solver not initialized!')
-            return None
-        
-        try:
-            # Use down-facing orientation if not specified
-            if target_quat is None:
-                target_quat = np.array([0.0, 1.0, 0.0, 0.0])  # gripper pointing down
-            
-            # Update MuJoCo data with current joints
-            self.mujoco_data.qpos[:6] = self.current_joints
-            mujoco.mj_forward(self.mujoco_model, self.mujoco_data)
-            
-            # Solve IK
-            joints, error = self.ik_solver.solve(
-                target_pos,
-                target_quat=target_quat,
-                max_iterations=500,
-                tolerance=0.01
-            )
-            
-            if error < 0.05:  # 5cm tolerance
-                return joints
-            else:
-                self.get_logger().warn(f'IK error too large: {error:.4f}m')
-                return joints  # Use anyway
-                
-        except Exception as e:
-            self.get_logger().error(f'IK failed: {e}')
-            return None
-
-    def move_to_joints(self, target_joints, duration=3.0):
-        """Send joint trajectory to UR driver."""
-        if target_joints is None:
+    def execute_jobs(self):
+        """Execute jobs from the queue (JointState or 'toggle_grip')."""
+        if not self.job_queue:
             return
         
-        # Create trajectory message
-        traj = JointTrajectory()
-        traj.joint_names = [
-            'shoulder_pan_joint',
-            'shoulder_lift_joint',
-            'elbow_joint',
-            'wrist_1_joint',
-            'wrist_2_joint',
-            'wrist_3_joint'
-        ]
+        next_job = self.job_queue.pop(0)
         
-        # Start point (current position)
-        point1 = JointTrajectoryPoint()
-        point1.positions = self.current_joints.tolist()
-        point1.time_from_start = Duration(sec=0, nanosec=0)
+        if isinstance(next_job, JointState):
+            # Plan and execute trajectory
+            traj = self.plan_to_joints(next_job)
+            if traj is None:
+                self.get_logger().error("Failed to plan to position")
+                return
+            
+            self.get_logger().info("Planned to position, executing...")
+            self._execute_joint_trajectory(traj.joint_trajectory)
+            
+        elif next_job == 'toggle_grip':
+            self.get_logger().info("Toggling gripper")
+            self._toggle_gripper()
+        else:
+            self.get_logger().error("Unknown job type.")
+            self.execute_jobs()  # Proceed to next job
+
+    def _toggle_gripper(self):
+        """Toggle gripper and proceed to next job."""
+        if not self.gripper_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('Gripper service not available')
+            return
         
-        # End point (target)
-        point2 = JointTrajectoryPoint()
-        point2.positions = target_joints.tolist()
-        point2.time_from_start = Duration(sec=int(duration), nanosec=int((duration % 1) * 1e9))
+        req = Trigger.Request()
+        future = self.gripper_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
         
-        traj.points = [point1, point2]
+        result = future.result()
+        if result is not None and result.success:
+            self.get_logger().info('✓ Gripper toggled')
+            # Publish gripper event for visualization
+            # Determine if this is grasp or release based on queue state
+            if len(self.job_queue) == 0 or (len(self.job_queue) > 0 and not isinstance(self.job_queue[0], str)):
+                # This was a release (grasp happens earlier in sequence)
+                if self.current_box_name:
+                    box_color = next((b["color"] for b in self.boxes if b["name"] == self.current_box_name), "unknown")
+                    self.publish_gripper_event(f'release:{self.current_box_name}:{box_color}_basket')
+            else:
+                # This was a grasp
+                if self.current_box_name:
+                    self.publish_gripper_event(f'grasp:{self.current_box_name}')
+        else:
+            self.get_logger().warn('Gripper toggle may have failed')
         
-        # Send via action
-        goal_msg = FollowJointTrajectory.Goal()
-        goal_msg.trajectory = traj
+        self.execute_jobs()  # Proceed to next job
+
+    def _execute_joint_trajectory(self, joint_traj):
+        """Execute joint trajectory via action client."""
+        self.get_logger().info('Waiting for controller action server...')
+        self._action_client.wait_for_server()
         
-        self._action_client.wait_for_server(timeout_sec=2.0)
-        future = self._action_client.send_goal_async(goal_msg)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = joint_traj
         
-        self.get_logger().info(f'  → Trajectory sent (duration: {duration:.1f}s)')
+        self.get_logger().info('Sending trajectory to controller...')
+        send_future = self._action_client.send_goal_async(goal)
+        send_future.add_done_callback(self._on_goal_sent)
+
+    def _on_goal_sent(self, future):
+        """Callback when goal is sent."""
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('Trajectory goal rejected')
+            return
+        
+        self.get_logger().info('Trajectory executing...')
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_exec_done)
+
+    def _on_exec_done(self, future):
+        """Callback when trajectory execution completes."""
+        try:
+            result = future.result().result
+            self.get_logger().info('✓ Trajectory execution complete')
+            self.execute_jobs()  # Proceed to next job
+        except Exception as e:
+            self.get_logger().error(f'Trajectory execution failed: {e}')
+
+    def compute_ik(self, current_joint_state, x, y, z,
+                   qx=0.0, qy=1.0, qz=0.0, qw=0.0):
+        """
+        Compute an IK solution for the UR5e given a target pose.
+        Based on the working IKPlanner implementation.
+        """
+        # Build the target pose
+        pose = PoseStamped()
+        pose.header.frame_id = 'base_link'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(x)
+        pose.pose.position.y = float(y)
+        pose.pose.position.z = float(z)
+        pose.pose.orientation.x = float(qx)
+        pose.pose.orientation.y = float(qy)
+        pose.pose.orientation.z = float(qz)
+        pose.pose.orientation.w = float(qw)
+
+        # Build IK request
+        ik_req = GetPositionIK.Request()
+        ik_req.ik_request = PositionIKRequest()
+        
+        # MoveIt group name for UR5e arm
+        ik_req.ik_request.group_name = 'ur_manipulator'
+        
+        # Name of the end-effector link
+        ik_req.ik_request.ik_link_name = 'tool0'
+        
+        # Seed state for IK
+        ik_req.ik_request.robot_state.joint_state = current_joint_state
+        
+        # Target pose
+        ik_req.ik_request.pose_stamped = pose
+        
+        # Collision checking and timeout
+        ik_req.ik_request.avoid_collisions = True
+        ik_req.ik_request.timeout = Duration(sec=2)
+        
+        # Also set top-level robot_state
+        ik_req.robot_state.joint_state = current_joint_state
+
+        # Call service
+        future = self.ik_client.call_async(ik_req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is None:
+            self.get_logger().error('IK service call failed.')
+            return None
+
+        result = future.result()
+        if result.error_code.val != result.error_code.SUCCESS:
+            self.get_logger().error(f'IK failed, error code: {result.error_code.val}')
+            return None
+
+        self.get_logger().info('✓ IK solution found')
+        return result.solution.joint_state
+
+    def plan_to_joints(self, target_joint_state):
+        """
+        Plan motion given a desired joint configuration.
+        Based on the working IKPlanner implementation.
+        """
+        req = GetMotionPlan.Request()
+        req.motion_plan_request.group_name = 'ur_manipulator'
+        req.motion_plan_request.allowed_planning_time = 5.0
+        req.motion_plan_request.planner_id = "RRTConnectkConfigDefault"
+
+        # Build goal constraints
+        goal_constraints = Constraints()
+        for name, pos in zip(target_joint_state.name, target_joint_state.position):
+            goal_constraints.joint_constraints.append(
+                JointConstraint(
+                    joint_name=name,
+                    position=pos,
+                    tolerance_above=0.01,
+                    tolerance_below=0.01,
+                    weight=1.0
+                )
+            )
+        req.motion_plan_request.goal_constraints.append(goal_constraints)
+
+        # Call planning service
+        future = self.plan_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is None:
+            self.get_logger().error('Planning service call failed.')
+            return None
+
+        result = future.result()
+        if result.motion_plan_response.error_code.val != 1:
+            self.get_logger().error(f'Planning failed, error code: {result.motion_plan_response.error_code.val}')
+            return None
+
+        self.get_logger().info('✓ Motion plan computed successfully')
+        return result.motion_plan_response.trajectory
 
     def publish_gripper_event(self, event):
         """Publish gripper event to scene manager."""

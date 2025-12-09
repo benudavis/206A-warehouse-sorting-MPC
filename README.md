@@ -66,6 +66,17 @@ uv run python tests/test_inverse_kinematics.py
 
 See [tests/README.md](tests/README.md) for test documentation.
 
+### Run with ROS 2
+
+```bash
+cd ros_nodes
+colcon build --packages-select warehouse_sorting
+source install/setup.bash
+ros2 launch warehouse_sorting warehouse_sorting.launch.py
+```
+
+See [ros_nodes/QUICKSTART.md](ros_nodes/QUICKSTART.md) for ROS documentation.
+
 ---
 
 ## Features
@@ -87,10 +98,12 @@ See [docs/GUIDE.md](docs/GUIDE.md) for detailed documentation.
 ├── scripts/          # Demonstration scripts
 │   ├── demo_sorting.py
 │   └── demo_color_sorting.py
+├── ros_nodes/        # ROS 2 package
+│   └── warehouse_sorting/  # MPC, IK, gripper, task planner nodes
 ├── tests/            # Test suite
 │   ├── test_forward_kinematics.py
 │   ├── test_inverse_kinematics.py
-│   └── run_all_tests.py
+│   └── test_mpc_controller.py
 ├── src/              # Source code
 │   ├── control/      # MPC, FK, IK controllers
 │   ├── diagnostics/  # Logging utilities

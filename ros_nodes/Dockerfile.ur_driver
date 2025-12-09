@@ -1,0 +1,17 @@
+FROM ros:humble-ros-base
+
+# Install UR ROS2 driver and dependencies
+RUN apt-get update && apt-get install -y \
+    ros-humble-ur-robot-driver \
+    ros-humble-ur-client-library \
+    ros-humble-ur-controllers \
+    ros-humble-joint-state-publisher \
+    ros-humble-robot-state-publisher \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up entrypoint
+RUN echo '#!/bin/bash\nset -e\nsource /opt/ros/humble/setup.bash\nexec "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

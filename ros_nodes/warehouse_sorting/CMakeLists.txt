@@ -30,8 +30,6 @@ install(PROGRAMS
   warehouse_sorting/ik_solver_node.py
   warehouse_sorting/gripper_controller_node.py
   warehouse_sorting/task_planner_node.py
-  warehouse_sorting/visualization_node.py
-  warehouse_sorting/box_publisher_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

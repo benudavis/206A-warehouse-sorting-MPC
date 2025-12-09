@@ -1,63 +1,37 @@
 #!/usr/bin/env python3
 """
-IK Solver Service Node
+IK Planner Node - MoveIt-based IK and Planning
 
-Provides inverse kinematics solving as a ROS service.
-Uses MuJoCo-based Jacobian IK solver.
+Provides IK solving and motion planning using MoveIt services.
+Based on the working IKPlanner implementation.
 """
-
-import sys
-from pathlib import Path
-import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose
+from moveit_msgs.srv import GetPositionIK, GetMotionPlan
+from moveit_msgs.msg import PositionIKRequest, Constraints, JointConstraint
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
-import mujoco
-
-# Add project root to path (Docker: /ros2_ws/src_project)
-sys.path.insert(0, '/ros2_ws/src_project')
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
-
-from control.inverse_kinematics import IKSolver
+from builtin_interfaces.msg import Duration
 
 
-class IKSolverNode(Node):
-    """ROS 2 node providing IK solving service."""
+class IKPlannerNode(Node):
+    """ROS 2 node providing MoveIt-based IK and planning."""
 
     def __init__(self):
-        super().__init__('ik_solver')
+        super().__init__('ik_planner')
         
-        # Parameters
-        self.declare_parameter('model_path', '')
-        self.declare_parameter('site_name', 'arm_hand_pinch')
+        # MoveIt service clients
+        self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
+        self.plan_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
         
-        model_path = self.get_parameter('model_path').value
-        site_name = self.get_parameter('site_name').value
+        # Wait for services
+        for srv, name in [(self.ik_client, 'compute_ik'),
+                          (self.plan_client, 'plan_kinematic_path')]:
+            while not srv.wait_for_service(timeout_sec=1.0):
+                self.get_logger().info(f'Waiting for /{name} service...')
         
-        # Load MuJoCo model
-        if not model_path:
-            # Build default model (same as demos)
-            # In Docker: /ros2_ws/sim/models
-            models_dir = Path("/ros2_ws/sim/models")
-            scene = mujoco.MjSpec.from_file(str(models_dir / "scene.xml"))
-            arm_spec = mujoco.MjSpec.from_file(str(models_dir / "universal_robots_ur5e" / "ur5e.xml"))
-            hand_spec = mujoco.MjSpec.from_file(str(models_dir / "robotiq_2f85" / "2f85.xml"))
-            arm_spec.site("attachment_site").attach_body(hand_spec.worldbody, "hand_", "")
-            scene.site("robot_site").attach_body(arm_spec.worldbody, "arm_", "")
-            self.model = scene.compile()
-        else:
-            self.model = mujoco.MjModel.from_xml_path(model_path)
-        
-        self.data = mujoco.MjData(self.model)
-        
-        # Initialize IK solver
-        self.ik_solver = IKSolver(self.model, self.data, site_name=site_name)
-        
-        self.get_logger().info(f'IK solver initialized with site: {site_name}')
-        
-        # Subscriber for current joint state
+        # Subscriber for current joint state (for warm starting)
         self.joint_state_sub = self.create_subscription(
             JointState,
             '/joint_states',
@@ -65,64 +39,129 @@ class IKSolverNode(Node):
             10
         )
         
-        # Service
-        # Note: Using basic types here; in production use custom SolveIK.srv
-        self.ik_service = self.create_service(
-            JointState,  # Placeholder - should use custom SolveIK srv
-            '~/solve_ik',
-            self.solve_ik_callback
-        )
+        self.current_joint_state = None
         
-        self.get_logger().info('IK Solver Service ready at ~/solve_ik')
+        self.get_logger().info('✓ IK Planner Node ready (using MoveIt services)')
 
     def joint_state_callback(self, msg):
-        """Update internal state from joint_states topic."""
+        """Update current joint state."""
         if len(msg.position) >= 6:
-            self.data.qpos[:6] = np.array(msg.position[:6])
-            mujoco.mj_forward(self.model, self.data)
+            self.current_joint_state = msg
 
-    def solve_ik_callback(self, request, response):
+    def compute_ik(self, current_joint_state, x, y, z,
+                   qx=0.0, qy=1.0, qz=0.0, qw=0.0):
         """
-        Solve IK service callback.
+        Compute an IK solution for the UR5e given a target pose.
         
-        In production, use custom SolveIK.srv with:
-          - geometry_msgs/Pose target
-          - bool use_orientation
-          - float64 tolerance
-          - int32 max_iterations
+        Args:
+            current_joint_state: sensor_msgs/JointState – current robot state
+            x, y, z: target position in base_link frame
+            qx, qy, qz, qw: target orientation as quaternion
+                            (default is 180° about y – end-effector flipped down)
+        
+        Returns:
+            JointState with solution, or None on failure
         """
-        try:
-            # Extract target from request (simplified)
-            # In production: target_pos = [request.target.position.x, ...]
-            target_pos = np.array([0.4, 0.0, 0.5])  # Placeholder
-            
-            # Solve IK
-            q_solution, success = self.ik_solver.solve(
-                target_pos,
-                target_quat=None,
-                max_iterations=100,
-                tolerance=0.01
+        # Build the target pose
+        pose = PoseStamped()
+        pose.header.frame_id = 'base_link'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(x)
+        pose.pose.position.y = float(y)
+        pose.pose.position.z = float(z)
+        pose.pose.orientation.x = float(qx)
+        pose.pose.orientation.y = float(qy)
+        pose.pose.orientation.z = float(qz)
+        pose.pose.orientation.w = float(qw)
+
+        # Build IK request
+        ik_req = GetPositionIK.Request()
+        ik_req.ik_request = PositionIKRequest()
+        
+        # MoveIt group name for UR5e arm
+        ik_req.ik_request.group_name = 'ur_manipulator'
+        
+        # Name of the end-effector link
+        ik_req.ik_request.ik_link_name = 'tool0'
+        
+        # Seed state for IK
+        ik_req.ik_request.robot_state.joint_state = current_joint_state
+        
+        # Target pose
+        ik_req.ik_request.pose_stamped = pose
+        
+        # Collision checking and timeout
+        ik_req.ik_request.avoid_collisions = True
+        ik_req.ik_request.timeout = Duration(sec=2)
+        
+        # Also set top-level robot_state
+        ik_req.robot_state.joint_state = current_joint_state
+
+        # Call service
+        future = self.ik_client.call_async(ik_req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is None:
+            self.get_logger().error('IK service call failed.')
+            return None
+
+        result = future.result()
+        if result.error_code.val != result.error_code.SUCCESS:
+            self.get_logger().error(f'IK failed, error code: {result.error_code.val}')
+            return None
+
+        self.get_logger().info('✓ IK solution found')
+        return result.solution.joint_state
+
+    def plan_to_joints(self, target_joint_state):
+        """
+        Plan motion given a desired joint configuration.
+        
+        Args:
+            target_joint_state: JointState with target joint positions
+        
+        Returns:
+            RobotTrajectory with planned path, or None on failure
+        """
+        req = GetMotionPlan.Request()
+        req.motion_plan_request.group_name = 'ur_manipulator'
+        req.motion_plan_request.allowed_planning_time = 5.0
+        req.motion_plan_request.planner_id = "RRTConnectkConfigDefault"
+
+        # Build goal constraints
+        goal_constraints = Constraints()
+        for name, pos in zip(target_joint_state.name, target_joint_state.position):
+            goal_constraints.joint_constraints.append(
+                JointConstraint(
+                    joint_name=name,
+                    position=pos,
+                    tolerance_above=0.01,
+                    tolerance_below=0.01,
+                    weight=1.0
+                )
             )
-            
-            # Build response
-            response.position = q_solution.tolist()
-            response.name = [f'joint_{i}' for i in range(len(q_solution))]
-            
-            if success:
-                self.get_logger().info(f'IK solved successfully')
-            else:
-                self.get_logger().warn(f'IK did not fully converge')
-            
-        except Exception as e:
-            self.get_logger().error(f'IK solve failed: {e}')
-            response.position = [0.0] * 6
-        
-        return response
+        req.motion_plan_request.goal_constraints.append(goal_constraints)
+
+        # Call planning service
+        future = self.plan_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        if future.result() is None:
+            self.get_logger().error('Planning service call failed.')
+            return None
+
+        result = future.result()
+        if result.motion_plan_response.error_code.val != 1:
+            self.get_logger().error(f'Planning failed, error code: {result.motion_plan_response.error_code.val}')
+            return None
+
+        self.get_logger().info('✓ Motion plan computed successfully')
+        return result.motion_plan_response.trajectory
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = IKSolverNode()
+    node = IKPlannerNode()
     
     try:
         rclpy.spin(node)

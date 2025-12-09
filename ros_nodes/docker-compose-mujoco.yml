@@ -1,0 +1,83 @@
+# MuJoCo Simulation with Docker + Mac Viewer
+# Run MuJoCo sim headless in Docker, view on Mac
+
+services:
+  # MuJoCo Simulation (headless in Docker)
+  mujoco_sim:
+    build:
+      context: ..
+      dockerfile: ros_nodes/Dockerfile
+    container_name: mujoco_sim
+    volumes:
+      - ../ros_nodes:/ros2_ws/src/ros_nodes:ro
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               source /ros2_ws/install/setup.bash &&
+               python3 /ros2_ws/src/ros_nodes/mujoco_sim_node.py
+                 --ros-args -p publish_box_positions:=true"
+    environment:
+      - ROS_DOMAIN_ID=42
+    networks:
+      - ros_network
+    restart: unless-stopped
+
+  # MPC Controller
+  mpc_controller:
+    build:
+      context: ..
+      dockerfile: ros_nodes/Dockerfile
+    container_name: mpc_controller
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               source /ros2_ws/install/setup.bash &&
+               ros2 run warehouse_sorting mpc_controller_node.py
+                 --ros-args -p horizon:=10"
+    environment:
+      - ROS_DOMAIN_ID=42
+    networks:
+      - ros_network
+    restart: unless-stopped
+    depends_on:
+      - mujoco_sim
+
+  # IK Solver
+  ik_solver:
+    build:
+      context: ..
+      dockerfile: ros_nodes/Dockerfile
+    container_name: ik_solver
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               source /ros2_ws/install/setup.bash &&
+               ros2 run warehouse_sorting ik_solver_node.py"
+    environment:
+      - ROS_DOMAIN_ID=42
+    networks:
+      - ros_network
+    restart: unless-stopped
+    depends_on:
+      - mujoco_sim
+
+  # Task Planner
+  task_planner:
+    build:
+      context: ..
+      dockerfile: ros_nodes/Dockerfile
+    container_name: task_planner
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               source /ros2_ws/install/setup.bash &&
+               ros2 run warehouse_sorting task_planner_node.py"
+    environment:
+      - ROS_DOMAIN_ID=42
+    networks:
+      - ros_network
+    restart: unless-stopped
+    depends_on:
+      - mujoco_sim
+      - ik_solver
+
+
+networks:
+  ros_network:
+    driver: bridge

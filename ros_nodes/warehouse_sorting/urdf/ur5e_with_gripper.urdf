@@ -1,0 +1,147 @@
+<?xml version="1.0"?>
+<!-- Simplified URDF for visualization -->
+<robot name="ur5e_with_gripper">
+  
+  <!-- Base link -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.05" length="0.1"/>
+      </geometry>
+      <material name="metal">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+  </link>
+  
+  <!-- Shoulder -->
+  <link name="shoulder_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.04" length="0.15"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.2 0.8 1"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0.163" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28" upper="6.28" effort="150" velocity="3.15"/>
+  </joint>
+  
+  <!-- Upper arm -->
+  <link name="upper_arm_link">
+    <visual>
+      <geometry>
+        <box size="0.425 0.08 0.08"/>
+      </geometry>
+      <material name="grey">
+        <color rgba="0.7 0.7 0.7 1"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <origin xyz="0 0 0" rpy="0 1.570796 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28" upper="6.28" effort="150" velocity="3.15"/>
+  </joint>
+  
+  <!-- Forearm -->
+  <link name="forearm_link">
+    <visual>
+      <geometry>
+        <box size="0.392 0.06 0.06"/>
+      </geometry>
+      <material name="grey"/>
+    </visual>
+  </link>
+  
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <origin xyz="0.425 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28" upper="6.28" effort="150" velocity="3.15"/>
+  </joint>
+  
+  <!-- Wrist 1 -->
+  <link name="wrist_1_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.03" length="0.1"/>
+      </geometry>
+      <material name="metal"/>
+    </visual>
+  </link>
+  
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <origin xyz="0.392 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28" upper="6.28" effort="28" velocity="3.2"/>
+  </joint>
+  
+  <!-- Wrist 2 -->
+  <link name="wrist_2_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.03" length="0.1"/>
+      </geometry>
+      <material name="metal"/>
+    </visual>
+  </link>
+  
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <origin xyz="0 -0.127 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28" upper="6.28" effort="28" velocity="3.2"/>
+  </joint>
+  
+  <!-- Wrist 3 / End effector -->
+  <link name="ee_link">
+    <visual>
+      <geometry>
+        <cylinder radius="0.025" length="0.08"/>
+      </geometry>
+      <material name="metal"/>
+    </visual>
+  </link>
+  
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link"/>
+    <child link="ee_link"/>
+    <origin xyz="0 0 -0.1" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.28" upper="6.28" effort="28" velocity="3.2"/>
+  </joint>
+  
+  <!-- Gripper (simplified) -->
+  <link name="gripper_link">
+    <visual>
+      <geometry>
+        <box size="0.08 0.12 0.04"/>
+      </geometry>
+      <material name="dark">
+        <color rgba="0.2 0.2 0.2 1"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="gripper_joint" type="fixed">
+    <parent link="ee_link"/>
+    <child link="gripper_link"/>
+    <origin xyz="0 -0.1 0" rpy="0 0 0"/>
+  </joint>
+  
+</robot>
