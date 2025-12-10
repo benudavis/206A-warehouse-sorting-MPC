@@ -73,7 +73,6 @@ class RealSensePCSubscriber(Node):
         # If the environment is bright, you might need to raise this to 0.3 or 0.35
         # If the environment is dark, lower it to 0.15 or 0.2
         black_threshold = 0.25 
-
         if r < black_threshold and g < black_threshold and b < black_threshold:
             return "black"
         elif r > g and r > b:
