@@ -28,6 +28,7 @@ This project implements Model Predictive Control (MPC) for a UR5e robotic arm an
 For now, the plane needs to be fit to the table manually. Do so with these commands:
 ```bash
 rviz2
+ros2 launch realsense2_camera rs_launch.py pointcloud.enable:=true \ rgb_camera.color_profile:=1920x1080x30
 ros2 run perception interactive_plane
 ```
 
@@ -35,7 +36,7 @@ To get the perception nodes running, first ensure communications are enabled on 
 Finally, run the perception launch file. Double check that the aruco tag number in the code matches the station.
 ```bash
 ros2 run ur7e_utils enable_comms
-ros2 run planning static_tf_transform // double check aruco tag marker
+ros2 run planning tf
 ros2 launch planning lab7_bringup.launch.py plane_a:=... plane_b:=... plane_c:=... plane_d:=... ar_marker:='ar_marker_...'
 ```
 
