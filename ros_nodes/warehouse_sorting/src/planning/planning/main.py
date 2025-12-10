@@ -222,17 +222,24 @@ class UR7e_CubeGrasp(Node):
         else:
             source_frame = self.camera_frame_id
         
+        # Extrapolate z_min and z_max in camera frame before transformation
+        # Extend the z range to make the obstacle larger in camera's z direction
+        z_extrapolation = 0.8  # meters - extend obstacle depth/height in camera z direction
+        z_min_extended = msg.z_min - z_extrapolation  # Extend backward in camera z
+        z_max_extended = msg.z_max + z_extrapolation  # Extend forward in camera z
+        
         # Transform the 8 corners of the bounding box from camera frame to base_link
         # This is the most accurate way to handle rotations
+        # Use extrapolated z values
         corners_camera = np.array([
-            [msg.x_min, msg.y_min, msg.z_min],
-            [msg.x_max, msg.y_min, msg.z_min],
-            [msg.x_min, msg.y_max, msg.z_min],
-            [msg.x_max, msg.y_max, msg.z_min],
-            [msg.x_min, msg.y_min, msg.z_max],
-            [msg.x_max, msg.y_min, msg.z_max],
-            [msg.x_min, msg.y_max, msg.z_max],
-            [msg.x_max, msg.y_max, msg.z_max],
+            [msg.x_min, msg.y_min, z_min_extended],
+            [msg.x_max, msg.y_min, z_min_extended],
+            [msg.x_min, msg.y_max, z_min_extended],
+            [msg.x_max, msg.y_max, z_min_extended],
+            [msg.x_min, msg.y_min, z_max_extended],
+            [msg.x_max, msg.y_min, z_max_extended],
+            [msg.x_min, msg.y_max, z_max_extended],
+            [msg.x_max, msg.y_max, z_max_extended],
         ])
         
         # Get transform from camera frame to base_link
@@ -296,7 +303,8 @@ class UR7e_CubeGrasp(Node):
         
         self.get_logger().info(
             f"Updated obstacle in base_link: center=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}), "
-            f"half_size=({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f})"
+            f"half_size=({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f}), "
+            f"z_extrapolated in camera frame: [{msg.z_min:.3f}, {msg.z_max:.3f}] -> [{z_min_extended:.3f}, {z_max_extended:.3f}]"
         )
 
     def _process_next_cube(self):
