@@ -75,7 +75,7 @@ class UR7e_CubeGrasp(Node):
         self.ik_planner = IKPlanner()
 
         # MPC controller for trajectory planning with obstacle avoidance
-        self.mpc = MPCController(n_joints=6, horizon=10, dt=0.05)
+        self.mpc = MPCController(n_joints=6, horizon=10, dt=0.1)  # Increased dt for faster execution
 
         # Publisher for MPC trajectory visualization in RViz
         self.mpc_traj_pub = self.create_publisher(
@@ -84,7 +84,9 @@ class UR7e_CubeGrasp(Node):
             1
         )
 
-        # Entries should be either JointState or the string 'toggle_grip'
+        # Entries should be either:
+        #   - (JointState, use_mpc: bool) for joint movements
+        #   - 'toggle_grip' for gripper actions
         self.job_queue = []
 
     def joint_state_callback(self, msg: JointState):
@@ -352,7 +354,8 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().error("IK failed for pre-grasp pose.")
             self.processing_cube = False
             return
-        self.job_queue.append(pre_grasp_js)
+        # Use MoveIt for pre-grasp (picking sequence)
+        self.job_queue.append((pre_grasp_js, False))
 
         # 2) Move to Grasp Position (lower the gripper to the cube)
         # DO NOT CHANGE z offset lower than +0.16
@@ -364,13 +367,15 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().error("IK failed for grasp pose.")
             self.processing_cube = False
             return
-        self.job_queue.append(grasp_js)
+        # Use MoveIt for grasp (picking sequence)
+        self.job_queue.append((grasp_js, False))
 
         # 3) Close the gripper
         self.job_queue.append('toggle_grip')
 
         # 4) Move back to Pre-Grasp Position (lift the block)
-        self.job_queue.append(pre_grasp_js)
+        # Use MoveIt for lift (picking sequence)
+        self.job_queue.append((pre_grasp_js, False))
 
         # 5) Move to release Position (use drop_location instead of hardcoded offset)
         rel_x = drop_location[0]
@@ -381,7 +386,8 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().error("IK failed for release pose.")
             self.processing_cube = False
             return
-        self.job_queue.append(release_js)
+        # Use MPC for release movement (with obstacle avoidance)
+        self.job_queue.append((release_js, True))
 
         # 6) Release the gripper
         self.job_queue.append('toggle_grip')
@@ -402,17 +408,30 @@ class UR7e_CubeGrasp(Node):
         self.get_logger().info(f"Executing job queue, {len(self.job_queue)} jobs remaining.")
         next_job = self.job_queue.pop(0)
 
-        if isinstance(next_job, JointState):
+        if isinstance(next_job, tuple) and len(next_job) == 2:
+            # Job is (JointState, use_mpc: bool)
+            target_js, use_mpc = next_job
+            
             if self.joint_state is None:
-                self.get_logger().error("No current joint state; cannot run MPC.")
+                self.get_logger().error("No current joint state; cannot plan trajectory.")
                 return
             
-            traj = self._plan_with_mpc(self.joint_state, next_job)
-            if traj is None:
-                self.get_logger().error("MPC failed to plan trajectory")
-                return
-            self.get_logger().info("MPC planned trajectory")
-            self._execute_joint_trajectory(traj)
+            if use_mpc:
+                # Use MPC for release movement (with obstacle avoidance)
+                traj = self._plan_with_mpc(self.joint_state, target_js)
+                if traj is None:
+                    self.get_logger().error("MPC failed to plan trajectory")
+                    return
+                self.get_logger().info("MPC planned trajectory")
+                self._execute_joint_trajectory(traj)
+            else:
+                # Use MoveIt plan_to_joints for picking sequence (pre-grasp, grasp, lift)
+                traj = self.ik_planner.plan_to_joints(target_js)
+                if traj is None:
+                    self.get_logger().error("Failed to plan to position using MoveIt")
+                    return
+                self.get_logger().info("MoveIt planned trajectory")
+                self._execute_joint_trajectory(traj.joint_trajectory)
         elif next_job == 'toggle_grip':
             self.get_logger().info("Toggling gripper")
             self._toggle_gripper()

@@ -150,9 +150,9 @@ class MPCController:
 
         # Cost weights (joint-space tracking + smoothness + velocity)
         self.Q = np.eye(n_joints) * 500.0
-        self.R = np.eye(n_joints) * 0.1
+        self.R = np.eye(n_joints) * 0.05  # Reduced smoothness penalty for faster motion
         self.Q_terminal = np.eye(n_joints) * 1000.0
-        self.Q_v = np.eye(n_joints) * 10.0  # Velocity cost weight
+        self.Q_v = np.eye(n_joints) * 1.0  # Velocity cost weight - much reduced to allow fast motions
 
         # Obstacle avoidance (soft margin)
         self.obstacle_weight = 1e4
@@ -162,7 +162,7 @@ class MPCController:
             np.array([-2 * np.pi] * n_joints),
             np.array([+2 * np.pi] * n_joints),
         )
-        self.max_velocity = 3.0  # [rad/s]
+        self.max_velocity = 8.0  # [rad/s] - increased for much faster motion
 
         # Obstacles: list of (center[3], half_size[3]) in base_link frame
         self.obstacles = []
