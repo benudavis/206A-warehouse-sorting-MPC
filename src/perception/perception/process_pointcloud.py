@@ -48,9 +48,9 @@ class RealSensePCSubscriber(Node):
         # Publishers
         self.cube_pose_pub = self.create_publisher(CubeArray, '/cube_poses', 1)
         self.filtered_points_pub = self.create_publisher(PointCloud2, '/filtered_points', 1)
-        self.obstacles_pub = self.create_publisher(BoxBounds, '/obstacles', 1)
+        self.obstacles_pub = self.create_publisher(BoxBounds, '/obstacles', 1) ## publisher for bounding boxes
         self.obstacle_marker_pub = self.create_publisher(Marker, '/obstacle_marker',1)
-        self.labeled_cube_pub = self.create_publisher(LabeledCubeArray, '/labeled_cubes', 1)
+        self.labeled_cube_pub = self.create_publisher(LabeledCubeArray, '/labeled_cubes', 1) ## publisher for labeled cubes
 
         self.get_logger().info("Subscribed to PointCloud2 topic and marker publisher ready")
 
@@ -61,6 +61,23 @@ class RealSensePCSubscriber(Node):
             return "red"
         elif g > r and g > b:
             return "green"
+        elif b > r and b > g:
+            return "blue"
+        else:
+            return "unknown"
+    
+    def classify_color(self, rgb_mean: np.ndarray) -> str:
+        r, g, b = rgb_mean[0], rgb_mean[1], rgb_mean[2]
+        
+        # Threshold for "black" (0.0 to 1.0 scale)
+        # If the environment is bright, you might need to raise this to 0.3 or 0.35
+        # If the environment is dark, lower it to 0.15 or 0.2
+        black_threshold = 0.25 
+
+        if r < black_threshold and g < black_threshold and b < black_threshold:
+            return "black"
+        elif r > g and r > b:
+            return "red"
         elif b > r and b > g:
             return "blue"
         else:
