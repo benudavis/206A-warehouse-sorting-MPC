@@ -8,10 +8,7 @@ from geometry_msgs.msg import PointStamped
 from moveit_msgs.msg import RobotTrajectory, DisplayTrajectory, RobotState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
-from tf2_ros import Buffer, TransformListener
-from tf2_geometry_msgs import do_transform_point
-from rclpy.time import Time
-from rclpy.duration import Duration
+# TF imports removed - transformations now handled by transform_perception node
 from custom_msgs.msg import LabeledCubeArray, LabeledCube, BoxBounds
 import numpy as np
 from planning.ik import IKPlanner
@@ -23,22 +20,19 @@ class UR7e_CubeGrasp(Node):
 
         super().__init__('cube_grasp')
 
-        # TF buffer & listener for transforming cube poses from camera to base_link
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # Subscribe to labeled cubes from cube_detector
+        # Subscribe to transformed perception topics (already in base_link frame)
+        # These are published by transform_perception node
         self.labeled_cubes_sub = self.create_subscription(
             LabeledCubeArray,
-            '/labeled_cubes',
+            '/labeled_cubes_base',  # Transformed to base_link by transform_perception
             self.labeled_cubes_callback,
             10
         )
 
-        # Subscribe to obstacles from cube_detector
+        # Subscribe to transformed obstacles (already in base_link frame)
         self.obstacles_sub = self.create_subscription(
             BoxBounds,
-            '/obstacles',
+            '/obstacles_base',  # Transformed to base_link by transform_perception
             self.obstacles_callback,
             10
         )
@@ -69,13 +63,13 @@ class UR7e_CubeGrasp(Node):
         self.processing_cube = False  # Flag to prevent processing multiple cubes simultaneously
         self.processed_cube_ids = set()  # Track processed cubes to avoid duplicates
         self.current_obstacles = []  # List of (center, half_size) tuples in base_link frame
-        self.camera_frame_id = None  # Track camera frame from labeled_cubes messages
 
         # IK planner node (uses MoveIt services)
         self.ik_planner = IKPlanner()
 
         # MPC controller for trajectory planning with obstacle avoidance
-        self.mpc = MPCController(n_joints=6, horizon=10, dt=0.1)  # Increased dt for faster execution
+        # Reduced horizon and increased dt for faster computation
+        self.mpc = MPCController(n_joints=6, horizon=6, dt=0.15)  # Faster: smaller horizon, larger dt
 
         # Publisher for MPC trajectory visualization in RViz
         self.mpc_traj_pub = self.create_publisher(
@@ -95,13 +89,9 @@ class UR7e_CubeGrasp(Node):
 
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
         """
-        Process LabeledCubeArray from cube_detector.
-        Filters by color (red/blue), transforms to base_link, and queues for processing.
+        Process LabeledCubeArray already transformed to base_link frame.
+        Filters by color (red/blue) and queues for processing.
         """
-        # Store camera frame_id for obstacle transformation
-        if msg.cubes:
-            self.camera_frame_id = msg.cubes[0].point.header.frame_id
-        
         if self.joint_state is None:
             self.get_logger().debug("No joint state yet, skipping cube processing")
             return
@@ -110,24 +100,21 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().debug("Already processing a cube, skipping new detections")
             return
 
-        # Process each cube in the array
+        # Process each cube in the array (already in base_link frame)
         for i, labeled_cube in enumerate(msg.cubes):
             # Only process red and blue cubes
             if labeled_cube.color_label not in ['red', 'blue']:
                 continue
 
-            # Create a unique ID for this cube (based on position and timestamp)
+            # Create a unique ID for this cube (based on position)
             cube_id = f"{labeled_cube.point.point.x:.4f}_{labeled_cube.point.point.y:.4f}_{labeled_cube.point.point.z:.4f}"
             
             # Skip if already processed
             if cube_id in self.processed_cube_ids:
                 continue
 
-            # Transform cube position from camera frame to base_link
-            cube_pose_base = self._transform_cube_to_base(labeled_cube.point)
-            if cube_pose_base is None:
-                self.get_logger().warn(f"Failed to transform cube {i} to base_link")
-                continue
+            # Cube is already in base_link frame (transformed by transform_perception node)
+            cube_pose_base = labeled_cube.point
 
             # Determine drop location based on color
             if labeled_cube.color_label == 'red':
@@ -151,149 +138,25 @@ class UR7e_CubeGrasp(Node):
         if self.cube_queue and not self.processing_cube:
             self._process_next_cube()
 
-    def _transform_cube_to_base(self, point_stamped: PointStamped) -> PointStamped:
-        """
-        Transform cube position from camera frame to base_link frame.
-        
-        Args:
-            point_stamped: PointStamped in camera frame
-            
-        Returns:
-            PointStamped in base_link frame, or None on failure
-        """
-        target_frame = 'base_link'
-        source_frame = point_stamped.header.frame_id
-
-        try:
-            # Look up transform from source_frame -> target_frame
-            transform = self.tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                Time(),  # latest available transform
-                timeout=Duration(seconds=1.0)
-            )
-        except Exception as e:
-            self.get_logger().warn(
-                f"Failed to lookup transform {source_frame} -> {target_frame}: {e}"
-            )
-            return None
-
-        # Apply transform to the point
-        transformed = do_transform_point(point_stamped, transform)
-
-        # Update header to reflect new frame and time
-        transformed.header.stamp = self.get_clock().now().to_msg()
-        transformed.header.frame_id = target_frame
-
-        return transformed
-
     def obstacles_callback(self, msg: BoxBounds):
         """
-        Process obstacle bounds from cube_detector.
-        Transforms bounding box from camera frame to base_link and updates MPC obstacles.
+        Process obstacle bounds already transformed to base_link frame.
+        Converts to (center, half_size) format for MPC.
         
         Args:
-            msg: BoxBounds message with x_min, x_max, y_min, y_max, z_min, z_max in camera frame
+            msg: BoxBounds message with x_min, x_max, y_min, y_max, z_min, z_max in base_link frame
         """
-        # Use the camera frame_id from the most recent labeled_cubes message
-        # If not available, try common camera frame names
-        if self.camera_frame_id is None:
-            source_frames = [
-                'camera_depth_optical_frame',
-                'camera_color_optical_frame',
-                'camera_link',
-            ]
-            source_frame = None
-            for frame in source_frames:
-                try:
-                    self.tf_buffer.lookup_transform(
-                        'base_link',
-                        frame,
-                        Time(),
-                        timeout=Duration(seconds=0.1)
-                    )
-                    source_frame = frame
-                    break
-                except:
-                    continue
-            if source_frame is None:
-                self.get_logger().warn("Could not determine camera frame for obstacle transformation")
-                return
-        else:
-            source_frame = self.camera_frame_id
-        
-        # Extrapolate z_min and z_max in camera frame before transformation
-        # Extend the z range to make the obstacle larger in camera's z direction
-        z_extrapolation = 0.8  # meters - extend obstacle depth/height in camera z direction
-        z_min_extended = msg.z_min - z_extrapolation  # Extend backward in camera z
-        z_max_extended = msg.z_max + z_extrapolation  # Extend forward in camera z
-        
-        # Transform the 8 corners of the bounding box from camera frame to base_link
-        # This is the most accurate way to handle rotations
-        # Use extrapolated z values
-        corners_camera = np.array([
-            [msg.x_min, msg.y_min, z_min_extended],
-            [msg.x_max, msg.y_min, z_min_extended],
-            [msg.x_min, msg.y_max, z_min_extended],
-            [msg.x_max, msg.y_max, z_min_extended],
-            [msg.x_min, msg.y_min, z_max_extended],
-            [msg.x_max, msg.y_min, z_max_extended],
-            [msg.x_min, msg.y_max, z_max_extended],
-            [msg.x_max, msg.y_max, z_max_extended],
-        ])
-        
-        # Get transform from camera frame to base_link
-        target_frame = 'base_link'
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                Time(),
-                timeout=Duration(seconds=0.5)
-            )
-        except Exception as e:
-            self.get_logger().warn(f"Could not find transform {source_frame} -> {target_frame} for obstacles: {e}")
-            return
-        
-        # Transform each corner to base_link
-        corners_base = []
-        
-        # Transform all corners
-        for corner in corners_camera:
-            point_stamped = PointStamped()
-            point_stamped.header.frame_id = source_frame
-            point_stamped.header.stamp = self.get_clock().now().to_msg()
-            point_stamped.point.x = float(corner[0])
-            point_stamped.point.y = float(corner[1])
-            point_stamped.point.z = float(corner[2])
-            
-            transformed = do_transform_point(point_stamped, transform)
-            corners_base.append([
-                transformed.point.x,
-                transformed.point.y,
-                transformed.point.z
-            ])
-        
-        corners_base = np.array(corners_base)
-        
-        # Compute new bounding box in base_link frame
-        x_min_base = float(np.min(corners_base[:, 0]))
-        x_max_base = float(np.max(corners_base[:, 0]))
-        y_min_base = float(np.min(corners_base[:, 1]))
-        y_max_base = float(np.max(corners_base[:, 1]))
-        z_min_base = float(np.min(corners_base[:, 2]))
-        z_max_base = float(np.max(corners_base[:, 2]))
-        
+        # Obstacle is already in base_link frame (transformed by transform_perception node)
         # Convert to (center, half_size) format for MPC
         center = np.array([
-            (x_min_base + x_max_base) / 2.0,
-            (y_min_base + y_max_base) / 2.0,
-            (z_min_base + z_max_base) / 2.0
+            (msg.x_min + msg.x_max) / 2.0,
+            (msg.y_min + msg.y_max) / 2.0,
+            (msg.z_min + msg.z_max) / 2.0
         ])
         half_size = np.array([
-            (x_max_base - x_min_base) / 2.0,
-            (y_max_base - y_min_base) / 2.0,
-            (z_max_base - z_min_base) / 2.0
+            (msg.x_max - msg.x_min) / 2.0,
+            (msg.y_max - msg.y_min) / 2.0,
+            (msg.z_max - msg.z_min) / 2.0
         ])
         
         # Update current obstacles (replace with latest obstacle)
@@ -302,12 +165,12 @@ class UR7e_CubeGrasp(Node):
         self.current_obstacles = [(center, half_size)]
         
         # Calculate actual dimensions (full size, not half_size)
-        dim_x = (x_max_base - x_min_base)
-        dim_y = (y_max_base - y_min_base)
-        dim_z = (z_max_base - z_min_base)
+        dim_x = (msg.x_max - msg.x_min)
+        dim_y = (msg.y_max - msg.y_min)
+        dim_z = (msg.z_max - msg.z_min)
         
         self.get_logger().info(
-            f"Obstacle detected and transformed to base_link:"
+            f"Obstacle in base_link:"
         )
         self.get_logger().info(
             f"  Center: ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}) m"
@@ -316,16 +179,12 @@ class UR7e_CubeGrasp(Node):
             f"  Dimensions: {dim_x:.3f} x {dim_y:.3f} x {dim_z:.3f} m (width x depth x height)"
         )
         self.get_logger().info(
-            f"  Bounds: x=[{x_min_base:.3f}, {x_max_base:.3f}], "
-            f"y=[{y_min_base:.3f}, {y_max_base:.3f}], "
-            f"z=[{z_min_base:.3f}, {z_max_base:.3f}] m"
+            f"  Bounds: x=[{msg.x_min:.3f}, {msg.x_max:.3f}], "
+            f"y=[{msg.y_min:.3f}, {msg.y_max:.3f}], "
+            f"z=[{msg.z_min:.3f}, {msg.z_max:.3f}] m"
         )
         self.get_logger().info(
             f"  Half-size: ({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f}) m"
-        )
-        self.get_logger().info(
-            f"  Original camera z: [{msg.z_min:.3f}, {msg.z_max:.3f}] -> "
-            f"Extended: [{z_min_extended:.3f}, {z_max_extended:.3f}] m"
         )
 
     def _process_next_cube(self):

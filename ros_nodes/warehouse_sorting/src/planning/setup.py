@@ -26,7 +26,7 @@ setup(
             'main = planning.main:main',
             'tf = planning.static_tf_transform:main',
             'ik = planning.ik:main',
-            'transform_cube_pose = planning.transform_cube_pose:main',
+            'transform_perception = planning.transform_perception:main',
             'forward_kinematics_node = planning.forward_kinematics_node:main',
         ],
     },

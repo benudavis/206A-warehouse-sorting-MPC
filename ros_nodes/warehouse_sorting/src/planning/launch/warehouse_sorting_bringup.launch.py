@@ -164,9 +164,21 @@ def generate_launch_description():
     )
 
     # --------------------------------------------------
+    # Transform perception messages from camera frame to base_link
+    # Transforms:
+    #   - /labeled_cubes (camera) -> /labeled_cubes_base (base_link)
+    #   - /obstacles (camera) -> /obstacles_base (base_link)
+    # --------------------------------------------------
+    transform_perception_node = Node(
+        package='planning',
+        executable='transform_perception',
+        name='transform_perception',
+        output='screen',
+    )
+
+    # --------------------------------------------------
     # Transform /cube_pose (camera frame) -> /cube_pose_in_base (base_link)
-    # (Legacy node - main.py now handles transforms directly for /labeled_cubes)
-    # Keep if other nodes still use /cube_pose_in_base
+    # (Legacy node - kept for backward compatibility if needed)
     # --------------------------------------------------
     # transform_cube_pose_node = Node(
     #     package='planning',
@@ -179,8 +191,8 @@ def generate_launch_description():
     # Pick-and-place node (uses MPC for trajectory planning with obstacle avoidance)
     # Run separately in a different terminal: ros2 run planning main
     # Subscribes to:
-    #   - /labeled_cubes (LabeledCubeArray): cubes with color labels for sorting
-    #   - /obstacles (BoxBounds): obstacles for MPC collision avoidance
+    #   - /labeled_cubes_base (LabeledCubeArray): cubes with color labels in base_link frame
+    #   - /obstacles_base (BoxBounds): obstacles in base_link frame for MPC collision avoidance
     #   - /joint_states: current robot joint state
     # Uses:
     #   - MoveIt services via IKPlanner
@@ -219,15 +231,13 @@ def generate_launch_description():
         # Perception / camera / TF / MoveIt
         realsense_launch,
         aruco_launch,
-        cube_detector_node,  # Advanced cube detection with color classification and obstacles
+        cube_detector_node, 
         # perception_node,  # Legacy: uncomment if needed
         planning_tf_node,
         static_base_world,
         moveit_launch,
+        transform_perception_node,  # Transform perception messages to base_link
         # transform_cube_pose_node,  # Legacy: uncomment if other nodes need /cube_pose_in_base
-
-        # Pick-and-place controller node (run separately: ros2 run planning main)
-        # pick_place_node,
 
         # Shutdown handling
         shutdown_on_any_exit,

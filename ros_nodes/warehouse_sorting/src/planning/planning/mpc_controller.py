@@ -141,8 +141,8 @@ class MPCController:
     def __init__(
         self,
         n_joints: int = 6,
-        horizon: int = 10,
-        dt: float = 0.05,
+        horizon: int = 6,  # Reduced default for faster computation
+        dt: float = 0.15,  # Increased default for faster execution
     ):
         self.n_joints = n_joints
         self.horizon = horizon
@@ -332,13 +332,14 @@ class MPCController:
 
         opts = {
             "ipopt.print_level": 0,
-            "ipopt.max_iter": 30,
+            "ipopt.max_iter": 15,  # Reduced from 30 for faster solves
             "print_time": 0,
-            "ipopt.tol": 5e-3,
-            "ipopt.acceptable_tol": 1e-2,
+            "ipopt.tol": 1e-2,  # Relaxed from 5e-3 for faster convergence
+            "ipopt.acceptable_tol": 2e-2,  # Relaxed from 1e-2
             "ipopt.warm_start_init_point": "yes",
             "ipopt.mu_strategy": "adaptive",
-            "ipopt.acceptable_iter": 3,
+            "ipopt.acceptable_iter": 1,  # Accept solution after just 1 acceptable iteration
+            "ipopt.fast_step_computation": "yes",  # Enable fast step computation
         }
 
         self.solver = ca.nlpsol("solver", "ipopt", nlp, opts)

@@ -53,6 +53,9 @@ class RealSensePCSubscriber(Node):
         self.obstacle_marker_pub = self.create_publisher(Marker, '/obstacle_marker', 1)
         self.labeled_cube_pub = self.create_publisher(LabeledCubeArray, '/labeled_cubes', 1)
 
+        # Track if obstacle has been published (only publish once to avoid EE being detected as obstacle)
+        self.obstacle_published = False
+
         self.get_logger().info("Subscribed to PointCloud2 topic and marker publisher ready")
 
     def classify_color(self, rgb_mean: np.ndarray) -> str:
@@ -154,7 +157,8 @@ class RealSensePCSubscriber(Node):
             cube.point.point.y = cube_y
             cube.point.point.z = cube_z
 
-            if len(indices) > 10000:
+            # Only publish obstacle once to avoid detecting the end-effector as an obstacle
+            if len(indices) > 10000 and not self.obstacle_published:
                 x_box = cluster_points[:, 0]
                 y_box = cluster_points[:, 1]
                 z_box = cluster_points[:, 2]
@@ -195,7 +199,8 @@ class RealSensePCSubscriber(Node):
                 obstacle_msg.z_max = float(z_box_max)
 
                 self.obstacles_pub.publish(obstacle_msg)
-                self.get_logger().info(f"Published Bounding Box for large cluster (size: {len(indices)}).")
+                self.obstacle_published = True  # Mark as published to prevent future updates
+                self.get_logger().info(f"Published Bounding Box for large cluster (size: {len(indices)}). Obstacle will not be updated again.")
 
             else:
                 cube_list.append(cube)
