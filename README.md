@@ -21,7 +21,25 @@ This project implements Model Predictive Control (MPC) for a UR5e robotic arm an
 - Complete data collection and training pipeline
 - Evaluation framework comparing MPC vs learned controller
 
-## Quick Start
+## Quick Start (ROS2)
+
+### Perception Node
+
+For now, the plane needs to be fit to the table manually. Do so with these commands:
+```bash
+rviz2
+ros2 run perception interactive_plane
+```
+
+To get the perception nodes running, first ensure communications are enabled on the UR7e. Then, run the node to publish the static transforms from aruco marker to base link. 
+Finally, run the perception launch file. Double check that the aruco tag number in the code matches the station.
+```bash
+ros2 run ur7e_utils enable_comms
+ros2 run planning static_tf_transform // double check aruco tag marker
+ros2 launch planning lab7_bringup.launch.py plane_a:=... plane_b:=... plane_c:=... plane_d:=... ar_marker:='ar_marker_...'
+```
+
+## Quick Start (simulation)
 
 ### Installation
 
