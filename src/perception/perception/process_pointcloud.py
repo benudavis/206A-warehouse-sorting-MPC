@@ -53,18 +53,6 @@ class RealSensePCSubscriber(Node):
         self.labeled_cube_pub = self.create_publisher(LabeledCubeArray, '/labeled_cubes', 1) ## publisher for labeled cubes
 
         self.get_logger().info("Subscribed to PointCloud2 topic and marker publisher ready")
-
-    def classify_color(self, rgb_mean: np.ndarray) -> str:
-        r, g, b = rgb_mean[0], rgb_mean[1], rgb_mean[2]
-        
-        if r > g and r > b:
-            return "red"
-        elif g > r and g > b:
-            return "green"
-        elif b > r and b > g:
-            return "blue"
-        else:
-            return "unknown"
     
     def classify_color(self, rgb_mean: np.ndarray) -> str:
         r, g, b = rgb_mean[0], rgb_mean[1], rgb_mean[2]
