@@ -77,6 +77,25 @@ def generate_launch_description():
     )
 
     # --------------------------------------------------
+    # Advanced cube detector: detects multiple cubes with color classification
+    # Publishes to /cube_poses (plural), /labeled_cubes, /obstacles
+    # Currently commented out - uncomment to use instead of process_pointcloud
+    # --------------------------------------------------
+    # cube_detector_node = Node(
+    #     package='perception',
+    #     executable='cube_detector',
+    #     name='cube_detector',
+    #     output='screen',
+    #     parameters=[{
+    #         'plane.a': plane_a,
+    #         'plane.b': plane_b,
+    #         'plane.c': plane_c,
+    #         'plane.d': plane_d,
+    #         'max_distance': 0.6,
+    #     }]
+    # )
+
+    # --------------------------------------------------
     # ArUco marker detection
     # --------------------------------------------------
     aruco_launch = IncludeLaunchDescription(

@@ -148,10 +148,11 @@ class MPCController:
         self.horizon = horizon
         self.dt = dt
 
-        # Cost weights (joint-space tracking + smoothness)
+        # Cost weights (joint-space tracking + smoothness + velocity)
         self.Q = np.eye(n_joints) * 500.0
         self.R = np.eye(n_joints) * 0.1
         self.Q_terminal = np.eye(n_joints) * 1000.0
+        self.Q_v = np.eye(n_joints) * 10.0  # Velocity cost weight
 
         # Obstacle avoidance (soft margin)
         self.obstacle_weight = 1e4
@@ -224,6 +225,7 @@ class MPCController:
 
         q = ca.SX.sym("q", n, H + 1)
         q_current = ca.SX.sym("q_current", n)
+        dq_current = ca.SX.sym("dq_current", n)  # Current velocity
         q_target = ca.SX.sym("q_target", n)
 
         obs_pos = ca.SX.sym("obs_pos", 3, self.n_max_obstacles)
@@ -234,12 +236,18 @@ class MPCController:
 
         # Running cost
         for k in range(H):
+            # Position tracking cost
             q_error = q[:, k] - q_target
             cost += ca.mtimes([q_error.T, self.Q, q_error])
 
+            # Position change cost (smoothness)
             if k > 0:
                 q_change = q[:, k] - q[:, k - 1]
                 cost += ca.mtimes([q_change.T, self.R, q_change])
+            
+            # Velocity cost (penalize high velocities for smoothness)
+            velocity_k = (q[:, k + 1] - q[:, k]) / self.dt
+            cost += ca.mtimes([velocity_k.T, self.Q_v, velocity_k])
 
         # Terminal cost
         q_error_final = q[:, H] - q_target
@@ -250,10 +258,17 @@ class MPCController:
         lbg = []
         ubg = []
 
-        # Initial condition
+        # Initial condition: position
         constraints.append(q[:, 0] - q_current)
         lbg.extend([0.0] * n)
         ubg.extend([0.0] * n)
+        
+        # Initial velocity constraint (soft - allows some deviation for smoother transitions)
+        # This encourages the first step to match current velocity but allows flexibility
+        velocity_0 = (q[:, 1] - q[:, 0]) / self.dt
+        velocity_error = velocity_0 - dq_current
+        # Add as soft cost instead of hard constraint for more flexibility
+        cost += 0.1 * ca.sumsqr(velocity_error)  # Small weight to encourage matching current velocity
 
         # Velocity constraints
         for k in range(H):
@@ -301,6 +316,7 @@ class MPCController:
         opt_variables = ca.reshape(q, -1, 1)
         opt_params = ca.vertcat(
             q_current,
+            dq_current,
             q_target,
             ca.reshape(obs_pos, -1, 1),
             ca.reshape(obs_size, -1, 1),
@@ -352,16 +368,28 @@ class MPCController:
             q_traj: (H+1, n_joints) full predicted trajectory.
         """
         q_current = np.asarray(current_state[: self.n_joints], dtype=float)
+        dq_current = np.asarray(current_state[self.n_joints:], dtype=float)
         q_target = np.asarray(target_state, dtype=float)
 
-        # Warm start
+        # Warm start: use current velocity to extrapolate motion
         if self.prev_solution is None:
             x0 = np.zeros(self.n_joints * (self.horizon + 1), dtype=float)
             for k in range(self.horizon + 1):
+                # Linear interpolation with velocity-aware extrapolation for first few steps
                 alpha = k / self.horizon
-                x0[k * self.n_joints : (k + 1) * self.n_joints] = (
-                    (1.0 - alpha) * q_current + alpha * q_target
-                )
+                if k == 0:
+                    # First step: current position
+                    x0[k * self.n_joints : (k + 1) * self.n_joints] = q_current
+                elif k == 1:
+                    # Second step: extrapolate using current velocity
+                    x0[k * self.n_joints : (k + 1) * self.n_joints] = (
+                        q_current + dq_current * self.dt
+                    )
+                else:
+                    # Remaining steps: interpolate toward target
+                    x0[k * self.n_joints : (k + 1) * self.n_joints] = (
+                        (1.0 - alpha) * q_current + alpha * q_target
+                    )
         else:
             x0 = np.zeros(self.n_joints * (self.horizon + 1), dtype=float)
             x0[: self.n_joints * self.horizon] = self.prev_solution[self.n_joints :]
@@ -377,7 +405,7 @@ class MPCController:
             obs_size_flat[i * 3 : (i + 1) * 3] = size
 
         params = np.concatenate(
-            [q_current, q_target, obs_pos_flat, obs_size_flat, np.array([n_active], dtype=float)]
+            [q_current, dq_current, q_target, obs_pos_flat, obs_size_flat, np.array([n_active], dtype=float)]
         )
 
         try:

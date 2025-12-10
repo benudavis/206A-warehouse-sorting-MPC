@@ -184,8 +184,18 @@ class UR7e_CubeGrasp(Node):
         
         q_target = np.array(target_js.position, dtype=float)
         
-        # Build current state [q, dq] - we don't use velocities, set to zero
-        dq_current = np.zeros_like(q_current)
+        # Extract actual joint velocities from current state
+        try:
+            dq_current = np.array(
+                [current_js.velocity[name_to_index[name]] for name in target_js.name],
+                dtype=float,
+            )
+        except (KeyError, IndexError):
+            # Fallback to zero if velocities not available
+            self.get_logger().warn("Velocities not available in joint state, using zero")
+            dq_current = np.zeros_like(q_current)
+        
+        # Build current state [q, dq]
         current_state = np.concatenate([q_current, dq_current])
         
         # Solve MPC
@@ -197,11 +207,23 @@ class UR7e_CubeGrasp(Node):
         jt.header.stamp = self.get_clock().now().to_msg()
         jt.header.frame_id = "base_link"
         
-        # Add trajectory points with timing
+        # Add trajectory points with timing and velocities
         from builtin_interfaces.msg import Duration
         for k in range(q_traj.shape[0]):
             pt = JointTrajectoryPoint()
             pt.positions = q_traj[k].tolist()
+            
+            # Compute velocities from position differences
+            if k < q_traj.shape[0] - 1:
+                velocities = (q_traj[k + 1] - q_traj[k]) / self.mpc.dt
+                pt.velocities = velocities.tolist()
+            else:
+                # Last point: zero velocity (or use previous velocity)
+                if k > 0:
+                    velocities = (q_traj[k] - q_traj[k - 1]) / self.mpc.dt
+                    pt.velocities = velocities.tolist()
+                else:
+                    pt.velocities = [0.0] * len(q_traj[k])
             
             # Time from start based on MPC dt
             t = float(k) * self.mpc.dt
