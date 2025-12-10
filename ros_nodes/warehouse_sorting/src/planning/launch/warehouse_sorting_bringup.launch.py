@@ -61,39 +61,43 @@ def generate_launch_description():
 
     # --------------------------------------------------
     # Perception node: process pointcloud -> /cube_pose
+    # (Legacy node, kept for backward compatibility)
     # --------------------------------------------------
-    perception_node = Node(
-        package='perception',
-        executable='process_pointcloud',
-        name='process_pointcloud',
-        output='screen',
-        parameters=[{
-            'plane.a': plane_a,
-            'plane.b': plane_b,
-            'plane.c': plane_c,
-            'plane.d': plane_d,
-            'max_distance': 0.6,  # optional, uses default if omitted
-        }]
-    )
-
-    # --------------------------------------------------
-    # Advanced cube detector: detects multiple cubes with color classification
-    # Publishes to /cube_poses (plural), /labeled_cubes, /obstacles
-    # Currently commented out - uncomment to use instead of process_pointcloud
-    # --------------------------------------------------
-    # cube_detector_node = Node(
+    # perception_node = Node(
     #     package='perception',
-    #     executable='cube_detector',
-    #     name='cube_detector',
+    #     executable='process_pointcloud',
+    #     name='process_pointcloud',
     #     output='screen',
     #     parameters=[{
     #         'plane.a': plane_a,
     #         'plane.b': plane_b,
     #         'plane.c': plane_c,
     #         'plane.d': plane_d,
-    #         'max_distance': 0.6,
+    #         'max_distance': 0.6,  # optional, uses default if omitted
     #     }]
     # )
+
+    # --------------------------------------------------
+    # Advanced cube detector: detects multiple cubes with color classification
+    # Publishes to:
+    #   - /cube_poses (CubeArray): unlabeled cubes
+    #   - /labeled_cubes (LabeledCubeArray): cubes with color labels (red/blue/green)
+    #   - /obstacles (BoxBounds): large clusters as obstacles for MPC avoidance
+    # Used by main.py for color-based sorting and obstacle avoidance
+    # --------------------------------------------------
+    cube_detector_node = Node(
+        package='perception',
+        executable='cube_detector',
+        name='cube_detector',
+        output='screen',
+        parameters=[{
+            'plane.a': plane_a,
+            'plane.b': plane_b,
+            'plane.c': plane_c,
+            'plane.d': plane_d,
+            'max_distance': 0.6,
+        }]
+    )
 
     # --------------------------------------------------
     # ArUco marker detection
@@ -161,29 +165,39 @@ def generate_launch_description():
 
     # --------------------------------------------------
     # Transform /cube_pose (camera frame) -> /cube_pose_in_base (base_link)
+    # (Legacy node - main.py now handles transforms directly for /labeled_cubes)
+    # Keep if other nodes still use /cube_pose_in_base
     # --------------------------------------------------
-    transform_cube_pose_node = Node(
-        package='planning',
-        executable='transform_cube_pose',
-        name='transform_cube_pose',
-        output='screen',
-    )
+    # transform_cube_pose_node = Node(
+    #     package='planning',
+    #     executable='transform_cube_pose',
+    #     name='transform_cube_pose',
+    #     output='screen',
+    # )
 
     # --------------------------------------------------
-    # Pick-and-place node (uses MPC for trajectory planning)
+    # Pick-and-place node (uses MPC for trajectory planning with obstacle avoidance)
+    # Run separately in a different terminal: ros2 run planning main
+    # Subscribes to:
+    #   - /labeled_cubes (LabeledCubeArray): cubes with color labels for sorting
+    #   - /obstacles (BoxBounds): obstacles for MPC collision avoidance
+    #   - /joint_states: current robot joint state
     # Uses:
-    #   - /cube_pose_in_base
-    #   - /joint_states
     #   - MoveIt services via IKPlanner
     #   - /scaled_joint_trajectory_controller/follow_joint_trajectory
     #   - /toggle_gripper
+    # Publishes:
+    #   - /display_planned_path: MPC trajectories for RViz visualization
+    # Features:
+    #   - Color-based sorting (red → [0.5, 0.2, 0.15], blue → [0.5, -0.2, 0.15])
+    #   - MPC trajectory planning with end-effector obstacle avoidance
     # --------------------------------------------------
-    pick_place_node = Node(
-        package='planning',
-        executable='main',  # from setup.py entry_points
-        name='pick_place',
-        output='screen',
-    )
+    # pick_place_node = Node(
+    #     package='planning',
+    #     executable='main',  # from setup.py entry_points
+    #     name='pick_place',
+    #     output='screen',
+    # )
 
     # --------------------------------------------------
     # Global shutdown on any process exit
@@ -205,14 +219,15 @@ def generate_launch_description():
         # Perception / camera / TF / MoveIt
         realsense_launch,
         aruco_launch,
-        perception_node,
+        cube_detector_node,  # Advanced cube detection with color classification and obstacles
+        # perception_node,  # Legacy: uncomment if needed
         planning_tf_node,
         static_base_world,
         moveit_launch,
-        transform_cube_pose_node,
+        # transform_cube_pose_node,  # Legacy: uncomment if other nodes need /cube_pose_in_base
 
-        # Pick-and-place controller node
-        pick_place_node,
+        # Pick-and-place controller node (run separately: ros2 run planning main)
+        # pick_place_node,
 
         # Shutdown handling
         shutdown_on_any_exit,
