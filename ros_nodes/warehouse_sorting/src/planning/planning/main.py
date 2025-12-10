@@ -5,10 +5,14 @@ from rclpy.action import ActionClient
 
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PointStamped 
-from moveit_msgs.msg import RobotTrajectory
+from moveit_msgs.msg import RobotTrajectory, DisplayTrajectory, RobotState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_point
+from rclpy.time import Time
+from rclpy.duration import Duration
+from custom_msgs.msg import LabeledCubeArray, LabeledCube, BoxBounds
 import numpy as np
 from planning.ik import IKPlanner
 from planning.mpc_controller import MPCController
@@ -19,12 +23,24 @@ class UR7e_CubeGrasp(Node):
 
         super().__init__('cube_grasp')
 
-        # Make sure this topic matches your transform node publisher
-        self.cube_pub = self.create_subscription(
-            PointStamped,
-            '/cube_pose_in_base',   # check topic alignment with transform_cube_pose.py
-            self.cube_callback,
-            1
+        # TF buffer & listener for transforming cube poses from camera to base_link
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # Subscribe to labeled cubes from cube_detector
+        self.labeled_cubes_sub = self.create_subscription(
+            LabeledCubeArray,
+            '/labeled_cubes',
+            self.labeled_cubes_callback,
+            10
+        )
+
+        # Subscribe to obstacles from cube_detector
+        self.obstacles_sub = self.create_subscription(
+            BoxBounds,
+            '/obstacles',
+            self.obstacles_callback,
+            10
         )
 
         self.joint_state_sub = self.create_subscription(
@@ -41,15 +57,32 @@ class UR7e_CubeGrasp(Node):
 
         self.gripper_cli = self.create_client(Trigger, '/toggle_gripper')
 
-        self.cube_pose = None
-        self.current_plan = None
+        # Hardcoded drop locations for color-based sorting
+        # Red cubes drop location (in base_link frame)
+        self.red_drop_location = [0.5, 0.2, 0.15]  # [x, y, z] in meters
+        # Blue cubes drop location (in base_link frame)
+        self.blue_drop_location = [0.5, -0.2, 0.15]  # [x, y, z] in meters
+
+        # State management
         self.joint_state = None
+        self.cube_queue = []  # Queue of (cube_pose, color, drop_location) tuples
+        self.processing_cube = False  # Flag to prevent processing multiple cubes simultaneously
+        self.processed_cube_ids = set()  # Track processed cubes to avoid duplicates
+        self.current_obstacles = []  # List of (center, half_size) tuples in base_link frame
+        self.camera_frame_id = None  # Track camera frame from labeled_cubes messages
 
         # IK planner node (uses MoveIt services)
         self.ik_planner = IKPlanner()
 
         # MPC controller for trajectory planning with obstacle avoidance
         self.mpc = MPCController(n_joints=6, horizon=10, dt=0.05)
+
+        # Publisher for MPC trajectory visualization in RViz
+        self.mpc_traj_pub = self.create_publisher(
+            DisplayTrajectory,
+            '/display_planned_path',
+            1
+        )
 
         # Entries should be either JointState or the string 'toggle_grip'
         self.job_queue = []
@@ -58,26 +91,248 @@ class UR7e_CubeGrasp(Node):
 
         self.joint_state = msg
 
-    def cube_callback(self, cube_pose: PointStamped):
+    def labeled_cubes_callback(self, msg: LabeledCubeArray):
+        """
+        Process LabeledCubeArray from cube_detector.
+        Filters by color (red/blue), transforms to base_link, and queues for processing.
+        """
+        # Store camera frame_id for obstacle transformation
+        if msg.cubes:
+            self.camera_frame_id = msg.cubes[0].point.header.frame_id
+        
+        if self.joint_state is None:
+            self.get_logger().debug("No joint state yet, skipping cube processing")
+            return
 
-        # Only process the first cube pose
-        if self.cube_pose is not None:
+        if self.processing_cube:
+            self.get_logger().debug("Already processing a cube, skipping new detections")
+            return
+
+        # Process each cube in the array
+        for i, labeled_cube in enumerate(msg.cubes):
+            # Only process red and blue cubes
+            if labeled_cube.color_label not in ['red', 'blue']:
+                continue
+
+            # Create a unique ID for this cube (based on position and timestamp)
+            cube_id = f"{labeled_cube.point.point.x:.4f}_{labeled_cube.point.point.y:.4f}_{labeled_cube.point.point.z:.4f}"
+            
+            # Skip if already processed
+            if cube_id in self.processed_cube_ids:
+                continue
+
+            # Transform cube position from camera frame to base_link
+            cube_pose_base = self._transform_cube_to_base(labeled_cube.point)
+            if cube_pose_base is None:
+                self.get_logger().warn(f"Failed to transform cube {i} to base_link")
+                continue
+
+            # Determine drop location based on color
+            if labeled_cube.color_label == 'red':
+                drop_location = self.red_drop_location
+            elif labeled_cube.color_label == 'blue':
+                drop_location = self.blue_drop_location
+            else:
+                continue  # Should not reach here due to filter above
+
+            # Add to queue
+            self.cube_queue.append((cube_pose_base, labeled_cube.color_label, drop_location))
+            self.processed_cube_ids.add(cube_id)
+            
+            self.get_logger().info(
+                f"Queued {labeled_cube.color_label} cube at "
+                f"({cube_pose_base.point.x:.3f}, {cube_pose_base.point.y:.3f}, {cube_pose_base.point.z:.3f}) "
+                f"for drop at ({drop_location[0]:.3f}, {drop_location[1]:.3f}, {drop_location[2]:.3f})"
+            )
+
+        # Start processing if queue has items and not currently processing
+        if self.cube_queue and not self.processing_cube:
+            self._process_next_cube()
+
+    def _transform_cube_to_base(self, point_stamped: PointStamped) -> PointStamped:
+        """
+        Transform cube position from camera frame to base_link frame.
+        
+        Args:
+            point_stamped: PointStamped in camera frame
+            
+        Returns:
+            PointStamped in base_link frame, or None on failure
+        """
+        target_frame = 'base_link'
+        source_frame = point_stamped.header.frame_id
+
+        try:
+            # Look up transform from source_frame -> target_frame
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),  # latest available transform
+                timeout=Duration(seconds=1.0)
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"Failed to lookup transform {source_frame} -> {target_frame}: {e}"
+            )
+            return None
+
+        # Apply transform to the point
+        transformed = do_transform_point(point_stamped, transform)
+
+        # Update header to reflect new frame and time
+        transformed.header.stamp = self.get_clock().now().to_msg()
+        transformed.header.frame_id = target_frame
+
+        return transformed
+
+    def obstacles_callback(self, msg: BoxBounds):
+        """
+        Process obstacle bounds from cube_detector.
+        Transforms bounding box from camera frame to base_link and updates MPC obstacles.
+        
+        Args:
+            msg: BoxBounds message with x_min, x_max, y_min, y_max, z_min, z_max in camera frame
+        """
+        # Use the camera frame_id from the most recent labeled_cubes message
+        # If not available, try common camera frame names
+        if self.camera_frame_id is None:
+            source_frames = [
+                'camera_depth_optical_frame',
+                'camera_color_optical_frame',
+                'camera_link',
+            ]
+            source_frame = None
+            for frame in source_frames:
+                try:
+                    self.tf_buffer.lookup_transform(
+                        'base_link',
+                        frame,
+                        Time(),
+                        timeout=Duration(seconds=0.1)
+                    )
+                    source_frame = frame
+                    break
+                except:
+                    continue
+            if source_frame is None:
+                self.get_logger().warn("Could not determine camera frame for obstacle transformation")
+                return
+        else:
+            source_frame = self.camera_frame_id
+        
+        # Transform the 8 corners of the bounding box from camera frame to base_link
+        # This is the most accurate way to handle rotations
+        corners_camera = np.array([
+            [msg.x_min, msg.y_min, msg.z_min],
+            [msg.x_max, msg.y_min, msg.z_min],
+            [msg.x_min, msg.y_max, msg.z_min],
+            [msg.x_max, msg.y_max, msg.z_min],
+            [msg.x_min, msg.y_min, msg.z_max],
+            [msg.x_max, msg.y_min, msg.z_max],
+            [msg.x_min, msg.y_max, msg.z_max],
+            [msg.x_max, msg.y_max, msg.z_max],
+        ])
+        
+        # Get transform from camera frame to base_link
+        target_frame = 'base_link'
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),
+                timeout=Duration(seconds=0.5)
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Could not find transform {source_frame} -> {target_frame} for obstacles: {e}")
+            return
+        
+        # Transform each corner to base_link
+        corners_base = []
+        
+        # Transform all corners
+        for corner in corners_camera:
+            point_stamped = PointStamped()
+            point_stamped.header.frame_id = source_frame
+            point_stamped.header.stamp = self.get_clock().now().to_msg()
+            point_stamped.point.x = float(corner[0])
+            point_stamped.point.y = float(corner[1])
+            point_stamped.point.z = float(corner[2])
+            
+            transformed = do_transform_point(point_stamped, transform)
+            corners_base.append([
+                transformed.point.x,
+                transformed.point.y,
+                transformed.point.z
+            ])
+        
+        corners_base = np.array(corners_base)
+        
+        # Compute new bounding box in base_link frame
+        x_min_base = float(np.min(corners_base[:, 0]))
+        x_max_base = float(np.max(corners_base[:, 0]))
+        y_min_base = float(np.min(corners_base[:, 1]))
+        y_max_base = float(np.max(corners_base[:, 1]))
+        z_min_base = float(np.min(corners_base[:, 2]))
+        z_max_base = float(np.max(corners_base[:, 2]))
+        
+        # Convert to (center, half_size) format for MPC
+        center = np.array([
+            (x_min_base + x_max_base) / 2.0,
+            (y_min_base + y_max_base) / 2.0,
+            (z_min_base + z_max_base) / 2.0
+        ])
+        half_size = np.array([
+            (x_max_base - x_min_base) / 2.0,
+            (y_max_base - y_min_base) / 2.0,
+            (z_max_base - z_min_base) / 2.0
+        ])
+        
+        # Update current obstacles (replace with latest obstacle)
+        # Note: cube_detector publishes one obstacle at a time, so we replace
+        # If multiple obstacles are needed, we'd need to track them differently
+        self.current_obstacles = [(center, half_size)]
+        
+        self.get_logger().info(
+            f"Updated obstacle in base_link: center=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}), "
+            f"half_size=({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f})"
+        )
+
+    def _process_next_cube(self):
+        """
+        Process the next cube from the queue.
+        """
+        if not self.cube_queue or self.processing_cube:
             return
 
         if self.joint_state is None:
-            self.get_logger().info("No joint state yet, cannot proceed")
+            self.get_logger().warn("No joint state available, cannot process cube")
             return
 
-        self.cube_pose = cube_pose
+        # Get next cube from queue
+        cube_pose, color, drop_location = self.cube_queue.pop(0)
+        self.processing_cube = True
 
         self.get_logger().info(
-            f"Received cube pose in base_link: "
+            f"Processing {color} cube at "
             f"({cube_pose.point.x:.3f}, {cube_pose.point.y:.3f}, {cube_pose.point.z:.3f})"
         )
 
-        # -----------------------------------------------------------
-        # Build the job queue of JointStates and 'toggle_grip' steps
-        # -----------------------------------------------------------
+        # Build job queue for this cube
+        self._build_cube_job_queue(cube_pose, drop_location)
+
+        # Start executing
+        self.execute_jobs()
+
+    def _build_cube_job_queue(self, cube_pose: PointStamped, drop_location: list):
+        """
+        Build the job queue for picking up a cube and placing it at drop_location.
+        
+        Args:
+            cube_pose: PointStamped in base_link frame with cube position
+            drop_location: [x, y, z] target drop location in base_link frame
+        """
+        # Clear any existing job queue
+        self.job_queue = []
 
         # Base cube position (in base_link frame)
         cx = cube_pose.point.x
@@ -95,6 +350,7 @@ class UR7e_CubeGrasp(Node):
         pre_grasp_js = self.ik_planner.compute_ik(self.joint_state, pre_x, pre_y, pre_z)
         if pre_grasp_js is None:
             self.get_logger().error("IK failed for pre-grasp pose.")
+            self.processing_cube = False
             return
         self.job_queue.append(pre_grasp_js)
 
@@ -106,6 +362,7 @@ class UR7e_CubeGrasp(Node):
         grasp_js = self.ik_planner.compute_ik(self.joint_state, grasp_x, grasp_y, grasp_z)
         if grasp_js is None:
             self.get_logger().error("IK failed for grasp pose.")
+            self.processing_cube = False
             return
         self.job_queue.append(grasp_js)
 
@@ -115,27 +372,31 @@ class UR7e_CubeGrasp(Node):
         # 4) Move back to Pre-Grasp Position (lift the block)
         self.job_queue.append(pre_grasp_js)
 
-        # 5) Move to release Position (0.4m on other side along x)
-        rel_x = cx + 0.4
-        rel_y = cy - 0.035
-        rel_z = cz + 0.185
+        # 5) Move to release Position (use drop_location instead of hardcoded offset)
+        rel_x = drop_location[0]
+        rel_y = drop_location[1]
+        rel_z = drop_location[2]
         release_js = self.ik_planner.compute_ik(self.joint_state, rel_x, rel_y, rel_z)
         if release_js is None:
             self.get_logger().error("IK failed for release pose.")
+            self.processing_cube = False
             return
         self.job_queue.append(release_js)
 
         # 6) Release the gripper
         self.job_queue.append('toggle_grip')
 
-        # Start executing the queue
-        self.execute_jobs()
-
     def execute_jobs(self):
 
         if not self.job_queue:
-            self.get_logger().info("All jobs completed.")
-            rclpy.shutdown()
+            self.get_logger().info("All jobs completed for current cube.")
+            # Mark that we're done processing this cube
+            self.processing_cube = False
+            # Process next cube if available
+            if self.cube_queue:
+                self._process_next_cube()
+            else:
+                self.get_logger().info("No more cubes in queue. Waiting for new detections...")
             return
 
         self.get_logger().info(f"Executing job queue, {len(self.job_queue)} jobs remaining.")
@@ -198,6 +459,11 @@ class UR7e_CubeGrasp(Node):
         # Build current state [q, dq]
         current_state = np.concatenate([q_current, dq_current])
         
+        # Update MPC obstacles with current obstacles (transformed to base_link)
+        self.mpc.clear_obstacles()
+        for center, half_size in self.current_obstacles:
+            self.mpc.add_obstacle(center, half_size)
+        
         # Solve MPC
         q_next, q_traj = self.mpc.compute_control(current_state, q_target)
         
@@ -233,7 +499,35 @@ class UR7e_CubeGrasp(Node):
             
             jt.points.append(pt)
         
+        # Publish trajectory for visualization in RViz
+        self._publish_mpc_trajectory(current_js, jt)
+        
         return jt
+
+    def _publish_mpc_trajectory(self, current_js: JointState, joint_traj: JointTrajectory):
+        """
+        Publish the MPC trajectory as DisplayTrajectory for visualization in RViz.
+        
+        RViz setup:
+          - Add "MotionPlanning" display
+          - In "Planned Path" tab, set topic to /display_planned_path
+        """
+        # RobotState: use current joint state as the starting state
+        robot_state = RobotState()
+        robot_state.joint_state = current_js
+
+        # RobotTrajectory: wrap the JointTrajectory
+        robot_traj = RobotTrajectory()
+        robot_traj.joint_trajectory = joint_traj
+
+        # DisplayTrajectory message
+        display_msg = DisplayTrajectory()
+        display_msg.model_id = "ur"  # UR robot model name for MoveIt
+        display_msg.trajectory_start = robot_state
+        display_msg.trajectory.append(robot_traj)
+
+        self.mpc_traj_pub.publish(display_msg)
+        self.get_logger().debug("Published MPC trajectory to /display_planned_path for RViz visualization")
 
     def _toggle_gripper(self):
 
@@ -282,6 +576,8 @@ class UR7e_CubeGrasp(Node):
             self.execute_jobs()  # Proceed to next job
         except Exception as e:
             self.get_logger().error(f'Execution failed: {e}')
+            # Reset processing flag on error so we can try again
+            self.processing_cube = False
 
 def main(args=None):
 
