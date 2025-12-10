@@ -301,10 +301,31 @@ class UR7e_CubeGrasp(Node):
         # If multiple obstacles are needed, we'd need to track them differently
         self.current_obstacles = [(center, half_size)]
         
+        # Calculate actual dimensions (full size, not half_size)
+        dim_x = (x_max_base - x_min_base)
+        dim_y = (y_max_base - y_min_base)
+        dim_z = (z_max_base - z_min_base)
+        
         self.get_logger().info(
-            f"Updated obstacle in base_link: center=({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}), "
-            f"half_size=({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f}), "
-            f"z_extrapolated in camera frame: [{msg.z_min:.3f}, {msg.z_max:.3f}] -> [{z_min_extended:.3f}, {z_max_extended:.3f}]"
+            f"Obstacle detected and transformed to base_link:"
+        )
+        self.get_logger().info(
+            f"  Center: ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}) m"
+        )
+        self.get_logger().info(
+            f"  Dimensions: {dim_x:.3f} x {dim_y:.3f} x {dim_z:.3f} m (width x depth x height)"
+        )
+        self.get_logger().info(
+            f"  Bounds: x=[{x_min_base:.3f}, {x_max_base:.3f}], "
+            f"y=[{y_min_base:.3f}, {y_max_base:.3f}], "
+            f"z=[{z_min_base:.3f}, {z_max_base:.3f}] m"
+        )
+        self.get_logger().info(
+            f"  Half-size: ({half_size[0]:.3f}, {half_size[1]:.3f}, {half_size[2]:.3f}) m"
+        )
+        self.get_logger().info(
+            f"  Original camera z: [{msg.z_min:.3f}, {msg.z_max:.3f}] -> "
+            f"Extended: [{z_min_extended:.3f}, {z_max_extended:.3f}] m"
         )
 
     def _process_next_cube(self):
