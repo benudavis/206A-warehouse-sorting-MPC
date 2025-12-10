@@ -1,20 +1,17 @@
-# ROS Libraries
-
-
 from std_srvs.srv import Trigger
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PointStamped 
 from moveit_msgs.msg import RobotTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
 from tf2_ros import Buffer, TransformListener
-from scipy.spatial.transform import Rotation as R
-
 import numpy as np
 from planning.ik import IKPlanner
+from planning.mpc_controller import MPCController
 
 class UR7e_CubeGrasp(Node):
 
@@ -50,6 +47,9 @@ class UR7e_CubeGrasp(Node):
 
         # IK planner node (uses MoveIt services)
         self.ik_planner = IKPlanner()
+
+        # MPC controller for trajectory planning with obstacle avoidance
+        self.mpc = MPCController(n_joints=6, horizon=10, dt=0.05)
 
         # Entries should be either JointState or the string 'toggle_grip'
         self.job_queue = []
@@ -142,18 +142,76 @@ class UR7e_CubeGrasp(Node):
         next_job = self.job_queue.pop(0)
 
         if isinstance(next_job, JointState):
-            traj = self.ik_planner.plan_to_joints(next_job)
-            if traj is None:
-                self.get_logger().error("Failed to plan to position")
+            if self.joint_state is None:
+                self.get_logger().error("No current joint state; cannot run MPC.")
                 return
-            self.get_logger().info("Planned to position")
-            self._execute_joint_trajectory(traj.joint_trajectory)
+            
+            traj = self._plan_with_mpc(self.joint_state, next_job)
+            if traj is None:
+                self.get_logger().error("MPC failed to plan trajectory")
+                return
+            self.get_logger().info("MPC planned trajectory")
+            self._execute_joint_trajectory(traj)
         elif next_job == 'toggle_grip':
             self.get_logger().info("Toggling gripper")
             self._toggle_gripper()
         else:
             self.get_logger().error("Unknown job type.")
-            self.execute_jobs()  # Proceed to next job
+            self.execute_jobs()  # Proceed to next jobplan_to_joints
+
+    def _plan_with_mpc(self, current_js: JointState, target_js: JointState) -> JointTrajectory:
+        """
+        Plan a trajectory from current joint state to target using MPC.
+        
+        Args:
+            current_js: Current joint state
+            target_js: Target joint state
+            
+        Returns:
+            JointTrajectory message ready to execute
+        """
+        # Extract joint positions, ensuring consistent ordering
+        name_to_index = {name: i for i, name in enumerate(current_js.name)}
+        
+        try:
+            q_current = np.array(
+                [current_js.position[name_to_index[name]] for name in target_js.name],
+                dtype=float,
+            )
+        except KeyError as e:
+            self.get_logger().error(f"Joint name mismatch: {e}")
+            return None
+        
+        q_target = np.array(target_js.position, dtype=float)
+        
+        # Build current state [q, dq] - we don't use velocities, set to zero
+        dq_current = np.zeros_like(q_current)
+        current_state = np.concatenate([q_current, dq_current])
+        
+        # Solve MPC
+        q_next, q_traj = self.mpc.compute_control(current_state, q_target)
+        
+        # Convert MPC trajectory to JointTrajectory format
+        jt = JointTrajectory()
+        jt.joint_names = list(target_js.name)
+        jt.header.stamp = self.get_clock().now().to_msg()
+        jt.header.frame_id = "base_link"
+        
+        # Add trajectory points with timing
+        from builtin_interfaces.msg import Duration
+        for k in range(q_traj.shape[0]):
+            pt = JointTrajectoryPoint()
+            pt.positions = q_traj[k].tolist()
+            
+            # Time from start based on MPC dt
+            t = float(k) * self.mpc.dt
+            secs = int(t)
+            nsecs = int((t - secs) * 1e9)
+            pt.time_from_start = Duration(sec=secs, nanosec=nsecs)
+            
+            jt.points.append(pt)
+        
+        return jt
 
     def _toggle_gripper(self):
 

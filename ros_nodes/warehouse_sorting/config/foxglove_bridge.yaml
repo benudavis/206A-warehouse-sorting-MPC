@@ -1,7 +1,0 @@
-# Foxglove Bridge Configuration
-port: 8765
-address: "0.0.0.0"
-tls: false
-topic_whitelist: [".*"]
-service_whitelist: [".*"]
-param_whitelist: [".*"]

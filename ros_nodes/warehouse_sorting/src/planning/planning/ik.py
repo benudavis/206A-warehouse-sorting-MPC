@@ -39,6 +39,7 @@ class IKPlanner(Node):
     def __init__(self):
 
         super().__init__('ik_planner')
+        self.last_ik_error_code = None
 
         # ---- Clients ----
         self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
@@ -76,36 +77,36 @@ class IKPlanner(Node):
         pose.pose.orientation.z = float(qz)
         pose.pose.orientation.w = float(qw)
 
-        # Build IK request
         ik_req = GetPositionIK.Request()
         ik_req.ik_request = PositionIKRequest()
-        # MoveIt group name for UR7e arm
-        ik_req.ik_request.group_name = 'ur_manipulator'
-        # Name of the end-effector link as defined in the UR MoveIt config
-        ik_req.ik_request.ik_link_name = 'tool0'
-        # Seed state for IK
-        ik_req.ik_request.robot_state.joint_state = current_joint_state
-        # Target pose
-        ik_req.ik_request.pose_stamped = pose
-        # Collision checking and timeout
+
         ik_req.ik_request.avoid_collisions = True
         ik_req.ik_request.timeout = Duration(sec=2)
-        # (Some versions of GetPositionIK also have a top-level robot_state;
-        # we at least fill the one inside PositionIKRequest, which MoveIt uses.)
-        ik_req.robot_state.joint_state = current_joint_state
+        ik_req.ik_request.group_name = 'ur_manipulator'
+
+        ik_req.ik_request.ik_link_name = 'tool0'
+
+        ik_req.ik_request.robot_state.joint_state = current_joint_state  
+
+        # Target pose
+        ik_req.ik_request.pose_stamped = pose
+
         # Call service
         future = self.ik_client.call_async(ik_req)
         rclpy.spin_until_future_complete(self, future)
 
         if future.result() is None:
+            self.last_ik_error_code = None
             self.get_logger().error('IK service failed.')
             return None
 
         result = future.result()
         if result.error_code.val != result.error_code.SUCCESS:
+            self.last_ik_error_code = result.error_code.val
             self.get_logger().error(f'IK failed, code: {result.error_code.val}')
             return None
 
+        self.last_ik_error_code = result.error_code.val
         self.get_logger().info('IK solution found.')
         return result.solution.joint_state
 
@@ -147,7 +148,6 @@ class IKPlanner(Node):
         return result.motion_plan_response.trajectory
 
 def main(args=None):
-
     rclpy.init(args=args)
     node = IKPlanner()
 
