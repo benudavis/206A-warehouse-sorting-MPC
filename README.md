@@ -31,7 +31,7 @@ rviz2
 ros2 run perception interactive_plane
 ```
 
-To get the perception nodes running, first ensure communications are enabled on the UR7e. Then, run the node to publish the static transforms from aruco marker to base link. 
+To get the perception nodes running, first ensure communications are enabled on the UR7e. Then, run the node to publish the static transforms from aruco marker to base link (Make sure code matches the ar_marker_# seen by the camera by modifying ~line 31 in static_tf_transform.py). 
 Finally, run the perception launch file. Double check that the aruco tag number in the code matches the station.
 ```bash
 ros2 run ur7e_utils enable_comms
