@@ -52,6 +52,7 @@ class UR7e_CubeGrasp(Node):
         self.blue_drop_location = [0.5, -0.2, 0.15]
 
         self.joint_state = None
+        self.initial_joint_state = None  # Store initial/home position
         self.cube_queue = []
         self.processing_cube = False
         self.processed_cube_ids = set()
@@ -75,8 +76,18 @@ class UR7e_CubeGrasp(Node):
         self.job_queue = []
 
     def joint_state_callback(self, msg: JointState):
-
         self.joint_state = msg
+        
+        # Store initial joint state on first callback (home position)
+        if self.initial_joint_state is None:
+            # Create a copy of the joint state to store as home position
+            self.initial_joint_state = JointState()
+            self.initial_joint_state.header = msg.header
+            self.initial_joint_state.name = list(msg.name)
+            self.initial_joint_state.position = list(msg.position)
+            self.initial_joint_state.velocity = list(msg.velocity) if msg.velocity else []
+            self.initial_joint_state.effort = list(msg.effort) if msg.effort else []
+            self.get_logger().info("Stored initial/home joint state")
 
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
         """Process detected cubes and queue them for picking."""
@@ -196,8 +207,11 @@ class UR7e_CubeGrasp(Node):
         pre_z = cz + 0.185
         pre_grasp_js = self.ik_planner.compute_ik(self.joint_state, pre_x, pre_y, pre_z)
         if pre_grasp_js is None:
-            self.get_logger().error("IK failed for pre-grasp pose.")
+            self.get_logger().error("IK failed for pre-grasp pose. Skipping this cube.")
             self.processing_cube = False
+            # Try to process next cube
+            if self.cube_queue:
+                self._process_next_cube()
             return
         self.job_queue.append((pre_grasp_js, False))
 
@@ -206,8 +220,11 @@ class UR7e_CubeGrasp(Node):
         grasp_z = cz + 0.16
         grasp_js = self.ik_planner.compute_ik(self.joint_state, grasp_x, grasp_y, grasp_z)
         if grasp_js is None:
-            self.get_logger().error("IK failed for grasp pose.")
+            self.get_logger().error("IK failed for grasp pose. Skipping this cube.")
             self.processing_cube = False
+            # Try to process next cube
+            if self.cube_queue:
+                self._process_next_cube()
             return
         self.job_queue.append((grasp_js, False))
 
@@ -219,12 +236,22 @@ class UR7e_CubeGrasp(Node):
         rel_z = drop_location[2]
         release_js = self.ik_planner.compute_ik(self.joint_state, rel_x, rel_y, rel_z)
         if release_js is None:
-            self.get_logger().error("IK failed for release pose.")
+            self.get_logger().error("IK failed for release pose. Skipping this cube.")
             self.processing_cube = False
+            # Try to process next cube
+            if self.cube_queue:
+                self._process_next_cube()
             return
         self.job_queue.append((release_js, True))
 
         self.job_queue.append('toggle_grip')
+        
+        # After releasing, return to initial/home position before processing next cube
+        if self.initial_joint_state is not None:
+            self.job_queue.append((self.initial_joint_state, False))
+            self.get_logger().info("Added return to home position after release")
+        else:
+            self.get_logger().warn("Initial joint state not available, skipping return to home")
 
     def execute_jobs(self):
 
@@ -250,14 +277,18 @@ class UR7e_CubeGrasp(Node):
             if use_mpc:
                 traj = self._plan_with_mpc(self.joint_state, target_js)
                 if traj is None:
-                    self.get_logger().error("MPC failed to plan trajectory")
+                    self.get_logger().error("MPC failed to plan trajectory. Attempting recovery...")
+                    # Error recovery: try to continue with next job or return to home
+                    self._handle_mpc_failure()
                     return
                 self.get_logger().info("MPC planned trajectory")
                 self._execute_joint_trajectory(traj)
             else:
                 traj = self.ik_planner.plan_to_joints(target_js)
                 if traj is None:
-                    self.get_logger().error("Failed to plan to position using MoveIt")
+                    self.get_logger().error("Failed to plan to position using MoveIt. Attempting recovery...")
+                    # Error recovery: try to continue with next job or return to home
+                    self._handle_moveit_failure()
                     return
                 self.get_logger().info("MoveIt planned trajectory")
                 self._execute_joint_trajectory(traj.joint_trajectory)
@@ -428,6 +459,58 @@ class UR7e_CubeGrasp(Node):
 
         self.get_logger().info('Gripper toggled.')
         self.execute_jobs()
+    
+    def _handle_mpc_failure(self):
+        """Handle MPC planning failure with recovery strategy."""
+        self.get_logger().warn("MPC planning failed. Clearing job queue and attempting recovery.")
+        
+        # Clear remaining jobs for this cube
+        self.job_queue = []
+        
+        # Try to return to home position if available
+        if self.initial_joint_state is not None:
+            self.get_logger().info("Attempting to return to home position for recovery")
+            home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
+            if home_traj is not None:
+                self._execute_joint_trajectory(home_traj.joint_trajectory)
+            else:
+                self.get_logger().error("Failed to plan return to home. Manual intervention may be required.")
+        else:
+            self.get_logger().error("Initial joint state not available for recovery")
+        
+        # Mark cube processing as failed
+        self.processing_cube = False
+        
+        # Try to process next cube if available
+        if self.cube_queue:
+            self.get_logger().info("Attempting to process next cube after recovery")
+            self._process_next_cube()
+        else:
+            self.get_logger().info("No more cubes in queue. Waiting for new detections...")
+    
+    def _handle_moveit_failure(self):
+        """Handle MoveIt planning failure with recovery strategy."""
+        self.get_logger().warn("MoveIt planning failed. Attempting recovery.")
+        
+        # For MoveIt failures, we can try to continue or return to home
+        # Clear the failed job
+        if self.job_queue:
+            self.get_logger().info("Skipping failed job, continuing with next job")
+            # Continue with next job
+            self.execute_jobs()
+        else:
+            # No more jobs, try to return to home
+            if self.initial_joint_state is not None:
+                self.get_logger().info("No more jobs, attempting to return to home position")
+                home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
+                if home_traj is not None:
+                    self._execute_joint_trajectory(home_traj.joint_trajectory)
+                else:
+                    self.get_logger().error("Failed to plan return to home")
+            
+            self.processing_cube = False
+            if self.cube_queue:
+                self._process_next_cube()
 
     def _execute_joint_trajectory(self, joint_traj):
 
@@ -443,26 +526,62 @@ class UR7e_CubeGrasp(Node):
         send_future.add_done_callback(self._on_goal_sent)
 
     def _on_goal_sent(self, future):
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.get_logger().error('Trajectory goal was not accepted by controller')
+                self._handle_execution_failure()
+                return
 
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('bonk')
-            rclpy.shutdown()
-            return
-
-        self.get_logger().info('Executing...')
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_exec_done)
+            self.get_logger().info('Executing...')
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(self._on_exec_done)
+        except Exception as e:
+            self.get_logger().error(f'Error sending trajectory goal: {e}')
+            self._handle_execution_failure()
 
     def _on_exec_done(self, future):
-
         try:
             result = future.result().result
-            self.get_logger().info('Execution complete.')
-            self.execute_jobs()
+            error_code = result.error_code if hasattr(result, 'error_code') else None
+            
+            if error_code is not None and error_code != 0:
+                self.get_logger().error(f'Trajectory execution failed with error code: {error_code}')
+                self._handle_execution_failure()
+            else:
+                self.get_logger().info('Execution complete.')
+                self.execute_jobs()
         except Exception as e:
             self.get_logger().error(f'Execution failed: {e}')
-            self.processing_cube = False
+            self._handle_execution_failure()
+    
+    def _handle_execution_failure(self):
+        """Handle trajectory execution failure with recovery strategy."""
+        self.get_logger().warn("Trajectory execution failed. Attempting recovery.")
+        
+        # Clear remaining jobs for this cube
+        self.job_queue = []
+        
+        # Try to return to home position if available
+        if self.initial_joint_state is not None:
+            self.get_logger().info("Attempting to return to home position after execution failure")
+            home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
+            if home_traj is not None:
+                self._execute_joint_trajectory(home_traj.joint_trajectory)
+            else:
+                self.get_logger().error("Failed to plan return to home. Manual intervention may be required.")
+        else:
+            self.get_logger().error("Initial joint state not available for recovery")
+        
+        # Mark cube processing as failed
+        self.processing_cube = False
+        
+        # Try to process next cube if available
+        if self.cube_queue:
+            self.get_logger().info("Attempting to process next cube after execution failure recovery")
+            self._process_next_cube()
+        else:
+            self.get_logger().info("No more cubes in queue. Waiting for new detections...")
 
 def main(args=None):
 

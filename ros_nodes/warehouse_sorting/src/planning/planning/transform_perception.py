@@ -70,28 +70,53 @@ class TransformPerception(Node):
         Args:
             msg: LabeledCubeArray in camera frame
         """
-        # Store camera frame_id for obstacle transformation
-        if msg.cubes:
-            self.camera_frame_id = msg.cubes[0].point.header.frame_id
+        if not msg.cubes:
+            return
 
-        # Transform each cube in the array
-        transformed_cubes = []
+        # Store camera frame_id for obstacle transformation
+        self.camera_frame_id = msg.cubes[0].point.header.frame_id
+
+        # Get transform once for all cubes (more efficient and avoids timing issues)
         target_frame = 'base_link'
+        source_frame = self.camera_frame_id
+        
+        try:
+            # Use the message timestamp for more accurate transforms
+            msg_time = Time.from_msg(msg.header.stamp)
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                msg_time,  # Use message timestamp instead of latest
+                timeout=Duration(seconds=1.0)
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"Failed to lookup transform {source_frame} -> {target_frame}: {e}. "
+                f"Skipping {len(msg.cubes)} cubes."
+            )
+            return
+
+        # Transform each cube in the array using the cached transform
+        transformed_cubes = []
 
         for i, labeled_cube in enumerate(msg.cubes):
-            # Transform the cube's point from camera frame to base_link
-            transformed_point = self._transform_point_to_base(labeled_cube.point, target_frame)
-            
-            if transformed_point is None:
-                self.get_logger().warn(f"Failed to transform cube {i} to base_link")
+            try:
+                # Apply the transform to the cube's point
+                transformed_point = do_transform_point(labeled_cube.point, transform)
+                
+                # Update header to reflect new frame
+                transformed_point.header.frame_id = target_frame
+                transformed_point.header.stamp = self.get_clock().now().to_msg()
+
+                # Create transformed labeled cube
+                transformed_cube = LabeledCube()
+                transformed_cube.point = transformed_point
+                transformed_cube.color_label = labeled_cube.color_label
+
+                transformed_cubes.append(transformed_cube)
+            except Exception as e:
+                self.get_logger().warn(f"Failed to transform cube {i}: {e}")
                 continue
-
-            # Create transformed labeled cube
-            transformed_cube = LabeledCube()
-            transformed_cube.point = transformed_point
-            transformed_cube.color_label = labeled_cube.color_label
-
-            transformed_cubes.append(transformed_cube)
 
         # Publish transformed array
         if transformed_cubes:
@@ -103,7 +128,7 @@ class TransformPerception(Node):
 
             self.labeled_cubes_base_pub.publish(transformed_array)
             self.get_logger().debug(
-                f"Transformed and published {len(transformed_cubes)} cubes to base_link"
+                f"Transformed and published {len(transformed_cubes)}/{len(msg.cubes)} cubes to base_link"
             )
 
     def obstacles_callback(self, msg: BoxBounds):
