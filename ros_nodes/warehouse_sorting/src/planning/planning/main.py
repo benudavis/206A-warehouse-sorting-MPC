@@ -8,18 +8,12 @@ from geometry_msgs.msg import PointStamped
 from moveit_msgs.msg import RobotTrajectory, DisplayTrajectory, RobotState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from sensor_msgs.msg import JointState
+# TF imports removed - transformations now handled by transform_perception node
 from custom_msgs.msg import LabeledCubeArray, LabeledCube, BoxBounds
 import numpy as np
 from planning.ik import IKPlanner
 from planning.mpc_controller import MPCController
 from planning.forward_kinematics import ur7e_forward_kinematics_from_angles
-
-# Try to import scipy for smooth trajectory interpolation
-try:
-    from scipy.interpolate import interp1d
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
 
 class UR7e_CubeGrasp(Node):
 
@@ -27,29 +21,19 @@ class UR7e_CubeGrasp(Node):
 
         super().__init__('cube_grasp')
 
-        # Subscribe to transformed cubes in base_link frame
-        # Note: This requires transform_perception node to be running
+        # Subscribe to transformed perception topics (already in base_link frame)
+        # These are published by transform_perception node
         self.labeled_cubes_sub = self.create_subscription(
             LabeledCubeArray,
-            '/labeled_cubes_base',
+            '/labeled_cubes_base',  # Transformed to base_link by transform_perception
             self.labeled_cubes_callback,
             10
         )
-        
-        # Also subscribe to raw cubes as fallback (for debugging)
-        self.labeled_cubes_raw_sub = self.create_subscription(
-            LabeledCubeArray,
-            '/labeled_cubes',
-            self.labeled_cubes_raw_callback,
-            10
-        )
-        
-        self.get_logger().info("Subscribed to /labeled_cubes_base (transformed to base_link)")
-        self.get_logger().info("Also subscribed to /labeled_cubes (raw, camera frame) for diagnostics")
 
+        # Subscribe to transformed obstacles (already in base_link frame)
         self.obstacles_sub = self.create_subscription(
             BoxBounds,
-            '/obstacles_base',
+            '/obstacles_base',  # Transformed to base_link by transform_perception
             self.obstacles_callback,
             10
         )
@@ -68,91 +52,88 @@ class UR7e_CubeGrasp(Node):
 
         self.gripper_cli = self.create_client(Trigger, '/toggle_gripper')
 
-        self.red_drop_location = [0.5, 0.2, 0.15]
-        self.blue_drop_location = [0.5, -0.2, 0.15]
+        # Hardcoded drop locations for color-based sorting
+        # Red cubes drop location (in base_link frame)
+        self.red_drop_location = [0.5, 0.2, 0.15]  # [x, y, z] in meters
+        # Blue cubes drop location (in base_link frame)
+        self.blue_drop_location = [0.5, -0.2, 0.15]  # [x, y, z] in meters
 
+        # State management
         self.joint_state = None
-        self.initial_joint_state = None  # Store initial/home position
-        self.cube_queue = []
-        self.processing_cube = False
-        self.processed_cube_ids = set()
-        self.current_obstacles = []
-        self.pick_height = None
-        self.gripper_closed = False
+        self.cube_queue = []  # Queue of (cube_pose, color, drop_location) tuples
+        self.processing_cube = False  # Flag to prevent processing multiple cubes simultaneously
+        self.processed_cube_ids = set()  # Track processed cubes to avoid duplicates
+        self.current_obstacles = []  # List of (center, half_size) tuples in base_link frame
+        self.gripper_closed = False  # Track gripper state
+        self.pick_height = None  # Store z-height when cube is picked (after moving up)
+        self.last_job_was_move_up = False  # Track if last job was the "move up after grip" step
 
+        # IK planner node (uses MoveIt services)
         self.ik_planner = IKPlanner()
-        self.mpc = MPCController(n_joints=6, horizon=6, dt=0.15)
+
+        # MPC controller for trajectory planning with obstacle avoidance
+        # Reduced horizon and increased dt for faster computation
+        self.mpc = MPCController(n_joints=6, horizon=6, dt=0.15)  # Faster: smaller horizon, larger dt
         
+        # Configure MPC with safety margin for obstacle avoidance
         safety_margin = 0.10
         self.mpc.set_safety_margin(safety_margin)
         self.get_logger().info(f"MPC configured with safety_margin={safety_margin:.3f}m (hard constraint)")
-        
-        # Trajectory smoothing parameters
-        self.smoothing_points_per_segment = self.declare_parameter('smoothing_points_per_segment', 5).value
-        self.get_logger().info(f"Trajectory smoothing: {self.smoothing_points_per_segment} points per segment (scipy available: {HAS_SCIPY})")
 
+        # Publisher for MPC trajectory visualization in RViz
         self.mpc_traj_pub = self.create_publisher(
             DisplayTrajectory,
             '/display_planned_path',
             1
         )
 
+        # Entries should be either:
+        #   - (JointState, use_mpc: bool) for joint movements
+        #   - 'toggle_grip' for gripper actions
         self.job_queue = []
 
     def joint_state_callback(self, msg: JointState):
-        self.joint_state = msg
-        
-        # Store initial joint state on first callback (home position)
-        if self.initial_joint_state is None:
-            # Create a copy of the joint state to store as home position
-            self.initial_joint_state = JointState()
-            self.initial_joint_state.header = msg.header
-            self.initial_joint_state.name = list(msg.name)
-            self.initial_joint_state.position = list(msg.position)
-            self.initial_joint_state.velocity = list(msg.velocity) if msg.velocity else []
-            self.initial_joint_state.effort = list(msg.effort) if msg.effort else []
-            self.get_logger().info("Stored initial/home joint state")
-            self.get_logger().info("Node is ready. Waiting for cube detections on /labeled_cubes_base...")
-            self.get_logger().info("Make sure transform_perception node is running to transform /labeled_cubes -> /labeled_cubes_base")
 
-    def labeled_cubes_raw_callback(self, msg: LabeledCubeArray):
-        """Diagnostic callback for raw cubes in camera frame."""
-        if len(msg.cubes) > 0:
-            self.get_logger().info(
-                f"[DIAGNOSTIC] Received {len(msg.cubes)} cube(s) on /labeled_cubes (camera frame). "
-                f"transform_perception node should transform these to /labeled_cubes_base"
-            )
-    
+        self.joint_state = msg
+
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
-        """Process detected cubes and queue them for picking."""
+        """
+        Process LabeledCubeArray already transformed to base_link frame.
+        Filters by color (red/blue) and queues for processing.
+        """
         if self.joint_state is None:
-            self.get_logger().warn("No joint state yet, skipping cube processing")
+            self.get_logger().debug("No joint state yet, skipping cube processing")
             return
 
         if self.processing_cube:
             self.get_logger().debug("Already processing a cube, skipping new detections")
             return
-        
-        self.get_logger().info(f"Received {len(msg.cubes)} cube(s) on /labeled_cubes_base (base_link frame)")
 
+        # Process each cube in the array (already in base_link frame)
         for i, labeled_cube in enumerate(msg.cubes):
+            # Only process red and blue cubes
             if labeled_cube.color_label not in ['red', 'blue']:
                 continue
 
+            # Create a unique ID for this cube (based on position)
             cube_id = f"{labeled_cube.point.point.x:.4f}_{labeled_cube.point.point.y:.4f}_{labeled_cube.point.point.z:.4f}"
             
+            # Skip if already processed
             if cube_id in self.processed_cube_ids:
                 continue
 
+            # Cube is already in base_link frame (transformed by transform_perception node)
             cube_pose_base = labeled_cube.point
 
+            # Determine drop location based on color
             if labeled_cube.color_label == 'red':
                 drop_location = self.red_drop_location
             elif labeled_cube.color_label == 'blue':
                 drop_location = self.blue_drop_location
             else:
-                continue
+                continue  # Should not reach here due to filter above
 
+            # Add to queue
             self.cube_queue.append((cube_pose_base, labeled_cube.color_label, drop_location))
             self.processed_cube_ids.add(cube_id)
             
@@ -162,11 +143,20 @@ class UR7e_CubeGrasp(Node):
                 f"for drop at ({drop_location[0]:.3f}, {drop_location[1]:.3f}, {drop_location[2]:.3f})"
             )
 
+        # Start processing if queue has items and not currently processing
         if self.cube_queue and not self.processing_cube:
             self._process_next_cube()
 
     def obstacles_callback(self, msg: BoxBounds):
-        """Process obstacle bounds and convert to (center, half_size) format for MPC."""
+        """
+        Process obstacle bounds already transformed to base_link frame.
+        Converts to (center, half_size) format for MPC.
+        
+        Args:
+            msg: BoxBounds message with x_min, x_max, y_min, y_max, z_min, z_max in base_link frame
+        """
+        # Obstacle is already in base_link frame (transformed by transform_perception node)
+        # Convert to (center, half_size) format for MPC
         center = np.array([
             (msg.x_min + msg.x_max) / 2.0,
             (msg.y_min + msg.y_max) / 2.0,
@@ -178,8 +168,12 @@ class UR7e_CubeGrasp(Node):
             (msg.z_max - msg.z_min) / 2.0
         ])
         
+        # Update current obstacles (replace with latest obstacle)
+        # Note: cube_detector publishes one obstacle at a time, so we replace
+        # If multiple obstacles are needed, we'd need to track them differently
         self.current_obstacles = [(center, half_size)]
         
+        # Calculate actual dimensions (full size, not half_size)
         dim_x = (msg.x_max - msg.x_min)
         dim_y = (msg.y_max - msg.y_min)
         dim_z = (msg.z_max - msg.z_min)
@@ -203,7 +197,9 @@ class UR7e_CubeGrasp(Node):
         )
 
     def _process_next_cube(self):
-        """Process the next cube from the queue."""
+        """
+        Process the next cube from the queue.
+        """
         if not self.cube_queue or self.processing_cube:
             return
 
@@ -211,17 +207,23 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().warn("No joint state available, cannot process cube")
             return
 
+        # Get next cube from queue
         cube_pose, color, drop_location = self.cube_queue.pop(0)
         self.processing_cube = True
+        # Reset state for new cube
         self.gripper_closed = False
         self.pick_height = None
+        self.last_job_was_move_up = False
 
         self.get_logger().info(
             f"Processing {color} cube at "
             f"({cube_pose.point.x:.3f}, {cube_pose.point.y:.3f}, {cube_pose.point.z:.3f})"
         )
 
+        # Build job queue for this cube
         self._build_cube_job_queue(cube_pose, drop_location)
+
+        # Start executing
         self.execute_jobs()
 
     def _build_cube_job_queue(self, cube_pose: PointStamped, drop_location: list):
@@ -232,68 +234,73 @@ class UR7e_CubeGrasp(Node):
             cube_pose: PointStamped in base_link frame with cube position
             drop_location: [x, y, z] target drop location in base_link frame
         """
+        # Clear any existing job queue
         self.job_queue = []
 
+        # Base cube position (in base_link frame)
         cx = cube_pose.point.x
         cy = cube_pose.point.y
         cz = cube_pose.point.z
 
+        # 1) Move to Pre-Grasp Position (gripper above the cube)
+        # Offsets:
+        #   x offset: 0.0
+        #   y offset: -0.035
+        #   z offset: +0.185
         pre_x = cx + 0.0
         pre_y = cy - 0.035
         pre_z = cz + 0.185
         pre_grasp_js = self.ik_planner.compute_ik(self.joint_state, pre_x, pre_y, pre_z)
         if pre_grasp_js is None:
-            self.get_logger().error("IK failed for pre-grasp pose. Skipping this cube.")
+            self.get_logger().error("IK failed for pre-grasp pose.")
             self.processing_cube = False
-            # Try to process next cube
-            if self.cube_queue:
-                self._process_next_cube()
             return
+        # Use MoveIt for pre-grasp (picking sequence)
         self.job_queue.append((pre_grasp_js, False))
 
+        # 2) Move to Grasp Position (lower the gripper to the cube)
+        # DO NOT CHANGE z offset lower than +0.16
         grasp_x = cx + 0.0
         grasp_y = cy - 0.035
         grasp_z = cz + 0.16
         grasp_js = self.ik_planner.compute_ik(self.joint_state, grasp_x, grasp_y, grasp_z)
         if grasp_js is None:
-            self.get_logger().error("IK failed for grasp pose. Skipping this cube.")
+            self.get_logger().error("IK failed for grasp pose.")
             self.processing_cube = False
-            # Try to process next cube
-            if self.cube_queue:
-                self._process_next_cube()
             return
+        # Use MoveIt for grasp (picking sequence)
         self.job_queue.append((grasp_js, False))
 
+        # 3) Close the gripper
         self.job_queue.append('toggle_grip')
-        self.job_queue.append((pre_grasp_js, False))
 
+        # 4) Move back to Pre-Grasp Position (lift the block)
+        # Use MoveIt for lift (picking sequence)
+        # Mark this job so we can detect when it completes and set minimum_z
+        self.job_queue.append((pre_grasp_js, False, 'move_up_after_grip'))
+
+        # 5) Move to release Position (use drop_location instead of hardcoded offset)
         rel_x = drop_location[0]
         rel_y = drop_location[1]
         rel_z = drop_location[2]
         release_js = self.ik_planner.compute_ik(self.joint_state, rel_x, rel_y, rel_z)
         if release_js is None:
-            self.get_logger().error("IK failed for release pose. Skipping this cube.")
+            self.get_logger().error("IK failed for release pose.")
             self.processing_cube = False
-            # Try to process next cube
-            if self.cube_queue:
-                self._process_next_cube()
             return
+        # Use MPC for release movement (with obstacle avoidance)
         self.job_queue.append((release_js, True))
 
+        # 6) Release the gripper
         self.job_queue.append('toggle_grip')
-        
-        # After releasing, return to initial/home position before processing next cube
-        if self.initial_joint_state is not None:
-            self.job_queue.append((self.initial_joint_state, False))
-            self.get_logger().info("Added return to home position after release")
-        else:
-            self.get_logger().warn("Initial joint state not available, skipping return to home")
 
     def execute_jobs(self):
 
         if not self.job_queue:
             self.get_logger().info("All jobs completed for current cube.")
+            # Mark that we're done processing this cube
             self.processing_cube = False
+            # Process next cube if available
             if self.cube_queue:
                 self._process_next_cube()
             else:
@@ -303,28 +310,38 @@ class UR7e_CubeGrasp(Node):
         self.get_logger().info(f"Executing job queue, {len(self.job_queue)} jobs remaining.")
         next_job = self.job_queue.pop(0)
 
-        if isinstance(next_job, tuple) and len(next_job) == 2:
-            target_js, use_mpc = next_job
+        if isinstance(next_job, tuple):
+            # Handle both (target_js, use_mpc) and (target_js, use_mpc, marker) formats
+            if len(next_job) == 2:
+                target_js, use_mpc = next_job
+                job_marker = None
+            elif len(next_job) == 3:
+                target_js, use_mpc, job_marker = next_job
+            else:
+                self.get_logger().error(f"Invalid job tuple format: {next_job}")
+                self.execute_jobs()
+                return
+            
+            # Store job marker to detect when "move up after grip" completes
+            self.last_job_was_move_up = (job_marker == 'move_up_after_grip')
             
             if self.joint_state is None:
                 self.get_logger().error("No current joint state; cannot plan trajectory.")
                 return
             
             if use_mpc:
+                # Use MPC for release movement (with obstacle avoidance)
                 traj = self._plan_with_mpc(self.joint_state, target_js)
                 if traj is None:
-                    self.get_logger().error("MPC failed to plan trajectory. Attempting recovery...")
-                    # Error recovery: try to continue with next job or return to home
-                    self._handle_mpc_failure()
+                    self.get_logger().error("MPC failed to plan trajectory")
                     return
                 self.get_logger().info("MPC planned trajectory")
                 self._execute_joint_trajectory(traj)
             else:
+                # Use MoveIt plan_to_joints for picking sequence (pre-grasp, grasp, lift)
                 traj = self.ik_planner.plan_to_joints(target_js)
                 if traj is None:
-                    self.get_logger().error("Failed to plan to position using MoveIt. Attempting recovery...")
-                    # Error recovery: try to continue with next job or return to home
-                    self._handle_moveit_failure()
+                    self.get_logger().error("Failed to plan to position using MoveIt")
                     return
                 self.get_logger().info("MoveIt planned trajectory")
                 self._execute_joint_trajectory(traj.joint_trajectory)
@@ -333,136 +350,140 @@ class UR7e_CubeGrasp(Node):
             self._toggle_gripper()
         else:
             self.get_logger().error("Unknown job type.")
-            self.execute_jobs()
+            self.execute_jobs()  # Proceed to next jobplan_to_joints
 
-    def _smooth_trajectory(self, joint_traj: JointTrajectory) -> JointTrajectory:
+    def _plan_with_mpc(self, current_js: JointState, target_js: JointState) -> JointTrajectory:
         """
-        Apply smooth cubic spline interpolation to a joint trajectory.
-        Adds intermediate waypoints between existing points for smoother execution.
+        Plan a trajectory from current joint state to target using MPC.
         
         Args:
-            joint_traj: Input JointTrajectory message
+            current_js: Current joint state
+            target_js: Target joint state
             
         Returns:
-            Smoothed JointTrajectory with interpolated waypoints
+            JointTrajectory message ready to execute
         """
-        if len(joint_traj.points) < 2:
-            # Not enough points to interpolate, return as-is
-            return joint_traj
-        
-        if not HAS_SCIPY:
-            # Scipy not available, return original trajectory
-            self.get_logger().debug("Scipy not available, skipping trajectory smoothing")
-            return joint_traj
-        
-        # Extract time stamps and positions
-        n_joints = len(joint_traj.joint_names)
-        n_points = len(joint_traj.points)
-        
-        # Convert time_from_start to seconds
-        times = []
-        positions = []
-        velocities = []
-        
-        for pt in joint_traj.points:
-            t_sec = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
-            times.append(t_sec)
-            positions.append(np.array(pt.positions))
-            velocities.append(np.array(pt.velocities) if len(pt.velocities) == n_joints else np.zeros(n_joints))
-        
-        times = np.array(times)
-        positions = np.array(positions)  # Shape: (n_points, n_joints)
-        velocities = np.array(velocities)  # Shape: (n_points, n_joints)
-        
-        # Create interpolated time points
-        # Add intermediate points between each pair of original points
-        n_interp = self.smoothing_points_per_segment
-        interp_times = []
-        
-        for i in range(n_points - 1):
-            t_start = times[i]
-            t_end = times[i + 1]
-            # Create segment with intermediate points (n_interp+1 points total, including endpoints)
-            segment_times = np.linspace(t_start, t_end, n_interp + 1)
-            if i == 0:
-                # First segment: include all points (start + intermediates)
-                interp_times.extend(segment_times)
-            else:
-                # Subsequent segments: skip first point to avoid duplicates with previous segment's end
-                interp_times.extend(segment_times[1:])
-        
-        # Final point should already be included from the last segment, but verify
-        interp_times = np.array(interp_times)
-        
-        # Remove any duplicates (within numerical precision)
-        if len(interp_times) > 1:
-            # Keep points where time difference is significant
-            unique_mask = np.ones(len(interp_times), dtype=bool)
-            for i in range(1, len(interp_times)):
-                if abs(interp_times[i] - interp_times[i-1]) < 1e-9:
-                    unique_mask[i] = False
-            interp_times = interp_times[unique_mask]
-        
-        # Interpolate each joint independently
-        interp_positions = np.zeros((len(interp_times), n_joints))
-        interp_velocities = np.zeros((len(interp_times), n_joints))
-        
-        # Choose interpolation method based on number of points
-        if n_points >= 4:
-            kind = 'cubic'
-        elif n_points >= 2:
-            kind = 'linear'
-        else:
-            kind = 'linear'
+        # Extract joint positions, ensuring consistent ordering
+        name_to_index = {name: i for i, name in enumerate(current_js.name)}
         
         try:
-            for j in range(n_joints):
-                # Interpolate positions
-                f_pos = interp1d(times, positions[:, j], kind=kind, 
-                                bounds_error=False, fill_value='extrapolate')
-                interp_positions[:, j] = f_pos(interp_times)
-                
-                # Interpolate velocities (if available)
-                if np.any(np.abs(velocities[:, j]) > 1e-6):  # Check if velocities are non-zero
-                    f_vel = interp1d(times, velocities[:, j], kind=kind,
-                                    bounds_error=False, fill_value='extrapolate')
-                    interp_velocities[:, j] = f_vel(interp_times)
-                else:
-                    # Compute velocities from position differences
-                    for k in range(len(interp_times)):
-                        if k < len(interp_times) - 1:
-                            dt = interp_times[k + 1] - interp_times[k]
-                            if dt > 1e-6:
-                                interp_velocities[k, j] = (interp_positions[k + 1, j] - interp_positions[k, j]) / dt
-                        elif k > 0:
-                            dt = interp_times[k] - interp_times[k - 1]
-                            if dt > 1e-6:
-                                interp_velocities[k, j] = (interp_positions[k, j] - interp_positions[k - 1, j]) / dt
-        except Exception as e:
-            self.get_logger().warn(f"Trajectory interpolation failed: {e}. Using original trajectory.")
-            return joint_traj
+            q_current = np.array(
+                [current_js.position[name_to_index[name]] for name in target_js.name],
+                dtype=float,
+            )
+        except KeyError as e:
+            self.get_logger().error(f"Joint name mismatch: {e}")
+            return None
         
-        # Create new smoothed trajectory
-        smoothed_traj = JointTrajectory()
-        smoothed_traj.joint_names = list(joint_traj.joint_names)
-        smoothed_traj.header = joint_traj.header
+        q_target = np.array(target_js.position, dtype=float)
         
+        # Extract actual joint velocities from current state
+        try:
+            dq_current = np.array(
+                [current_js.velocity[name_to_index[name]] for name in target_js.name],
+                dtype=float,
+            )
+        except (KeyError, IndexError):
+            # Fallback to zero if velocities not available
+            self.get_logger().warn("Velocities not available in joint state, using zero")
+            dq_current = np.zeros_like(q_current)
+        
+        # Build current state [q, dq]
+        current_state = np.concatenate([q_current, dq_current])
+        
+        # Update MPC obstacles with current obstacles (transformed to base_link)
+        self.mpc.clear_obstacles()
+        for center, half_size in self.current_obstacles:
+            self.mpc.add_obstacle(center, half_size)
+        
+        # Solve MPC
+        q_next, q_traj = self.mpc.compute_control(current_state, q_target)
+        
+        # Convert MPC trajectory to JointTrajectory format
+        jt = JointTrajectory()
+        jt.joint_names = list(target_js.name)
+        jt.header.stamp = self.get_clock().now().to_msg()
+        jt.header.frame_id = "base_link"
+        
+        # Add trajectory points with timing and velocities
         from builtin_interfaces.msg import Duration
-        
-        for k, t in enumerate(interp_times):
+        for k in range(q_traj.shape[0]):
             pt = JointTrajectoryPoint()
-            pt.positions = interp_positions[k].tolist()
-            pt.velocities = interp_velocities[k].tolist()
+            pt.positions = q_traj[k].tolist()
             
+            # Compute velocities from position differences
+            if k < q_traj.shape[0] - 1:
+                velocities = (q_traj[k + 1] - q_traj[k]) / self.mpc.dt
+                pt.velocities = velocities.tolist()
+            else:
+                # Last point: zero velocity (or use previous velocity)
+                if k > 0:
+                    velocities = (q_traj[k] - q_traj[k - 1]) / self.mpc.dt
+                    pt.velocities = velocities.tolist()
+                else:
+                    pt.velocities = [0.0] * len(q_traj[k])
+            
+            # Time from start based on MPC dt
+            t = float(k) * self.mpc.dt
             secs = int(t)
             nsecs = int((t - secs) * 1e9)
             pt.time_from_start = Duration(sec=secs, nanosec=nsecs)
             
-            smoothed_traj.points.append(pt)
+            jt.points.append(pt)
         
-        self.get_logger().debug(f"Smoothed trajectory: {n_points} -> {len(smoothed_traj.points)} points")
+        # Publish trajectory for visualization in RViz
+        self._publish_mpc_trajectory(current_js, jt)
         
-        return smoothed_traj
+        return jt
+
+    def _publish_mpc_trajectory(self, current_js: JointState, joint_traj: JointTrajectory):
+        """
+        Publish the MPC trajectory as DisplayTrajectory for visualization in RViz.
+        
+        RViz setup:
+          - Add "MotionPlanning" display
+          - In "Planned Path" tab, set topic to /display_planned_path
+        """
+        # RobotState: use current joint state as the starting state
+        robot_state = RobotState()
+        robot_state.joint_state = current_js
+
+        # RobotTrajectory: wrap the JointTrajectory
+        robot_traj = RobotTrajectory()
+        robot_traj.joint_trajectory = joint_traj
+
+        # DisplayTrajectory message
+        display_msg = DisplayTrajectory()
+        display_msg.model_id = "ur"  # UR robot model name for MoveIt
+        display_msg.trajectory_start = robot_state
+        display_msg.trajectory.append(robot_traj)
+
+        self.mpc_traj_pub.publish(display_msg)
+        self.get_logger().debug("Published MPC trajectory to /display_planned_path for RViz visualization")
+
+    def _toggle_gripper(self):
+        """Toggle gripper and manage minimum_z constraint."""
+        if not self.gripper_cli.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error('Gripper service not available')
+            return
+
+        req = Trigger.Request()
+        future = self.gripper_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+
+        self.gripper_closed = not self.gripper_closed
+        
+        if self.gripper_closed:
+            self.get_logger().info("Gripper closed. Will set minimum_z constraint after moving up.")
+        else:
+            # Clear minimum_z when opening gripper
+            if hasattr(self.mpc, 'clear_minimum_z'):
+                self.mpc.clear_minimum_z()
+            self.pick_height = None
+            self.get_logger().info("Gripper opened. Cleared minimum_z constraint")
+
+        self.get_logger().info('Gripper toggled.')
+        self.execute_jobs()  # Proceed to next job
     
     def _compute_end_effector_z(self, joint_state: JointState) -> float:
         """
@@ -490,195 +511,36 @@ class UR7e_CubeGrasp(Node):
         except (KeyError, IndexError, Exception) as e:
             self.get_logger().error(f"Failed to compute end-effector z: {e}")
             return None
-
-    def _plan_with_mpc(self, current_js: JointState, target_js: JointState) -> JointTrajectory:
+    
+    def _set_minimum_z_after_move_up(self):
         """
-        Plan a trajectory from current joint state to target using MPC.
-        
-        Args:
-            current_js: Current joint state
-            target_js: Target joint state
-            
-        Returns:
-            JointTrajectory message ready to execute
+        Set minimum_z constraint after the arm has moved up after gripping.
+        This ensures we capture the correct height (after moving up, not at grasp height).
+        The constraint prevents the arm from going below this height during MPC-controlled movements.
         """
-        name_to_index = {name: i for i, name in enumerate(current_js.name)}
+        if not self.gripper_closed:
+            return  # Gripper not closed, don't set constraint
         
-        try:
-            q_current = np.array(
-                [current_js.position[name_to_index[name]] for name in target_js.name],
-                dtype=float,
-            )
-        except KeyError as e:
-            self.get_logger().error(f"Joint name mismatch: {e}")
-            return None
-        
-        q_target = np.array(target_js.position, dtype=float)
-        
-        try:
-            dq_current = np.array(
-                [current_js.velocity[name_to_index[name]] for name in target_js.name],
-                dtype=float,
-            )
-        except (KeyError, IndexError):
-            self.get_logger().warn("Velocities not available in joint state, using zero")
-            dq_current = np.zeros_like(q_current)
-        
-        current_state = np.concatenate([q_current, dq_current])
-        
-        self.mpc.clear_obstacles()
-        for center, half_size in self.current_obstacles:
-            self.mpc.add_obstacle(center, half_size)
-        
-        q_next, q_traj = self.mpc.compute_control(current_state, q_target)
-        
-        jt = JointTrajectory()
-        jt.joint_names = list(target_js.name)
-        jt.header.stamp = self.get_clock().now().to_msg()
-        jt.header.frame_id = "base_link"
-        
-        from builtin_interfaces.msg import Duration
-        for k in range(q_traj.shape[0]):
-            pt = JointTrajectoryPoint()
-            pt.positions = q_traj[k].tolist()
-            
-            if k < q_traj.shape[0] - 1:
-                velocities = (q_traj[k + 1] - q_traj[k]) / self.mpc.dt
-                pt.velocities = velocities.tolist()
-            else:
-                if k > 0:
-                    velocities = (q_traj[k] - q_traj[k - 1]) / self.mpc.dt
-                    pt.velocities = velocities.tolist()
-                else:
-                    pt.velocities = [0.0] * len(q_traj[k])
-            
-            t = float(k) * self.mpc.dt
-            secs = int(t)
-            nsecs = int((t - secs) * 1e9)
-            pt.time_from_start = Duration(sec=secs, nanosec=nsecs)
-            
-            jt.points.append(pt)
-        
-        # Apply smooth interpolation to the trajectory
-        jt_smooth = self._smooth_trajectory(jt)
-        
-        self._publish_mpc_trajectory(current_js, jt_smooth)
-        
-        return jt_smooth
-
-    def _publish_mpc_trajectory(self, current_js: JointState, joint_traj: JointTrajectory):
-        """
-        Publish the MPC trajectory as DisplayTrajectory for visualization in RViz.
-        
-        RViz setup:
-          - Add "MotionPlanning" display
-          - In "Planned Path" tab, set topic to /display_planned_path
-        """
-        robot_state = RobotState()
-        robot_state.joint_state = current_js
-
-        robot_traj = RobotTrajectory()
-        robot_traj.joint_trajectory = joint_traj
-
-        display_msg = DisplayTrajectory()
-        display_msg.model_id = "ur"
-        display_msg.trajectory_start = robot_state
-        display_msg.trajectory.append(robot_traj)
-
-        self.mpc_traj_pub.publish(display_msg)
-        self.get_logger().debug("Published MPC trajectory to /display_planned_path for RViz visualization")
-
-    def _toggle_gripper(self):
-        """
-        Toggle gripper and manage minimum_z constraint.
-        When closing: set minimum_z = pick_height - 0.01m (1cm margin below pick height)
-        When opening: clear minimum_z constraint
-        """
-        if not self.gripper_cli.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error('Gripper service not available')
-            rclpy.shutdown()
+        if self.joint_state is None:
+            self.get_logger().warn("No joint state available, cannot set minimum_z")
             return
-
-        req = Trigger.Request()
-        future = self.gripper_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
-
-        self.gripper_closed = not self.gripper_closed
         
-        if self.gripper_closed:
-            if self.joint_state is not None:
-                pick_height = self._compute_end_effector_z(self.joint_state)
-                if pick_height is not None:
-                    self.pick_height = pick_height
-                    minimum_z = pick_height - 0.01
-                    self.mpc.set_minimum_z(minimum_z)
-                    self.get_logger().info(
-                        f"Gripper closed. Set minimum_z={minimum_z:.3f}m "
-                        f"(pick_height={pick_height:.3f}m - 1cm margin)"
-                    )
-                else:
-                    self.get_logger().warn("Could not compute pick height, minimum_z not set")
+        # Compute current end-effector z position (after moving up)
+        current_z = self._compute_end_effector_z(self.joint_state)
+        if current_z is not None:
+            self.pick_height = current_z
+            minimum_z = current_z - 0.01  # 1cm margin below current height
+            if hasattr(self.mpc, 'set_minimum_z'):
+                self.mpc.set_minimum_z(minimum_z)
+                self.get_logger().info(
+                    f"Set minimum_z constraint: {minimum_z:.3f}m "
+                    f"(current EE z={current_z:.3f}m - 1cm margin). "
+                    f"Arm will not go below this height during MPC movements."
+                )
             else:
-                self.get_logger().warn("No joint state available, minimum_z not set")
+                self.get_logger().warn("MPC controller does not support set_minimum_z method")
         else:
-            self.mpc.clear_minimum_z()
-            self.pick_height = None
-            self.get_logger().info("Gripper opened. Cleared minimum_z constraint")
-
-        self.get_logger().info('Gripper toggled.')
-        self.execute_jobs()
-    
-    def _handle_mpc_failure(self):
-        """Handle MPC planning failure with recovery strategy."""
-        self.get_logger().warn("MPC planning failed. Clearing job queue and attempting recovery.")
-        
-        # Clear remaining jobs for this cube
-        self.job_queue = []
-        
-        # Try to return to home position if available
-        if self.initial_joint_state is not None:
-            self.get_logger().info("Attempting to return to home position for recovery")
-            home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
-            if home_traj is not None:
-                self._execute_joint_trajectory(home_traj.joint_trajectory)
-            else:
-                self.get_logger().error("Failed to plan return to home. Manual intervention may be required.")
-        else:
-            self.get_logger().error("Initial joint state not available for recovery")
-        
-        # Mark cube processing as failed
-        self.processing_cube = False
-        
-        # Try to process next cube if available
-        if self.cube_queue:
-            self.get_logger().info("Attempting to process next cube after recovery")
-            self._process_next_cube()
-        else:
-            self.get_logger().info("No more cubes in queue. Waiting for new detections...")
-    
-    def _handle_moveit_failure(self):
-        """Handle MoveIt planning failure with recovery strategy."""
-        self.get_logger().warn("MoveIt planning failed. Attempting recovery.")
-        
-        # For MoveIt failures, we can try to continue or return to home
-        # Clear the failed job
-        if self.job_queue:
-            self.get_logger().info("Skipping failed job, continuing with next job")
-            # Continue with next job
-            self.execute_jobs()
-        else:
-            # No more jobs, try to return to home
-            if self.initial_joint_state is not None:
-                self.get_logger().info("No more jobs, attempting to return to home position")
-                home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
-                if home_traj is not None:
-                    self._execute_joint_trajectory(home_traj.joint_trajectory)
-                else:
-                    self.get_logger().error("Failed to plan return to home")
-            
-            self.processing_cube = False
-            if self.cube_queue:
-                self._process_next_cube()
+            self.get_logger().warn("Could not compute end-effector z, minimum_z not set")
 
     def _execute_joint_trajectory(self, joint_traj):
 
@@ -694,62 +556,33 @@ class UR7e_CubeGrasp(Node):
         send_future.add_done_callback(self._on_goal_sent)
 
     def _on_goal_sent(self, future):
-        try:
-            goal_handle = future.result()
-            if not goal_handle.accepted:
-                self.get_logger().error('Trajectory goal was not accepted by controller')
-                self._handle_execution_failure()
-                return
 
-            self.get_logger().info('Executing...')
-            result_future = goal_handle.get_result_async()
-            result_future.add_done_callback(self._on_exec_done)
-        except Exception as e:
-            self.get_logger().error(f'Error sending trajectory goal: {e}')
-            self._handle_execution_failure()
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('bonk')
+            rclpy.shutdown()
+            return
+
+        self.get_logger().info('Executing...')
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_exec_done)
 
     def _on_exec_done(self, future):
         try:
             result = future.result().result
-            error_code = result.error_code if hasattr(result, 'error_code') else None
+            self.get_logger().info('Execution complete.')
             
-            if error_code is not None and error_code != 0:
-                self.get_logger().error(f'Trajectory execution failed with error code: {error_code}')
-                self._handle_execution_failure()
-            else:
-                self.get_logger().info('Execution complete.')
-                self.execute_jobs()
+            # Check if we just completed the "move up after grip" step
+            # If so, set minimum_z constraint now (after arm has moved up)
+            if self.last_job_was_move_up and self.gripper_closed:
+                self._set_minimum_z_after_move_up()
+                self.last_job_was_move_up = False  # Reset flag
+            
+            self.execute_jobs()  # Proceed to next job
         except Exception as e:
             self.get_logger().error(f'Execution failed: {e}')
-            self._handle_execution_failure()
-    
-    def _handle_execution_failure(self):
-        """Handle trajectory execution failure with recovery strategy."""
-        self.get_logger().warn("Trajectory execution failed. Attempting recovery.")
-        
-        # Clear remaining jobs for this cube
-        self.job_queue = []
-        
-        # Try to return to home position if available
-        if self.initial_joint_state is not None:
-            self.get_logger().info("Attempting to return to home position after execution failure")
-            home_traj = self.ik_planner.plan_to_joints(self.initial_joint_state)
-            if home_traj is not None:
-                self._execute_joint_trajectory(home_traj.joint_trajectory)
-            else:
-                self.get_logger().error("Failed to plan return to home. Manual intervention may be required.")
-        else:
-            self.get_logger().error("Initial joint state not available for recovery")
-        
-        # Mark cube processing as failed
-        self.processing_cube = False
-        
-        # Try to process next cube if available
-        if self.cube_queue:
-            self.get_logger().info("Attempting to process next cube after execution failure recovery")
-            self._process_next_cube()
-        else:
-            self.get_logger().info("No more cubes in queue. Waiting for new detections...")
+            # Reset processing flag on error so we can try again
+            self.processing_cube = False
 
 def main(args=None):
 
