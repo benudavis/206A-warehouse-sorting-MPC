@@ -212,6 +212,27 @@ def generate_launch_description():
     # )
 
     # --------------------------------------------------
+    # MPC Visualization Node: Real-time 3D visualization of MPC trajectories
+    # Subscribes to:
+    #   - /joint_states: current robot joint state (computes end-effector position)
+    #   - /display_planned_path: MPC trajectory horizons
+    #   - /labeled_cubes_base: cube positions with colors
+    #   - /obstacles_base: obstacle positions
+    # Features:
+    #   - Interactive 3D matplotlib visualization
+    #   - Shows MPC horizons, executed path, cubes, obstacles
+    #   - Updates in real-time (every 0.5s)
+    #   - Saves final visualization as PNG when node exits (Ctrl+C)
+    #   - Visualization persists even if main node is killed
+    # --------------------------------------------------
+    mpc_visualization_node = Node(
+        package='planning',
+        executable='mpc_visualization',  # from setup.py entry_points
+        name='mpc_visualization',
+        output='screen',
+    )
+
+    # --------------------------------------------------
     # Global shutdown on any process exit
     # --------------------------------------------------
     shutdown_on_any_exit = RegisterEventHandler(
@@ -238,6 +259,9 @@ def generate_launch_description():
         moveit_launch,
         transform_perception_node,  # Transform perception messages to base_link
         # transform_cube_pose_node,  # Legacy: uncomment if other nodes need /cube_pose_in_base
+
+        # Visualization
+        mpc_visualization_node,  # Real-time 3D MPC trajectory visualization
 
         # Shutdown handling
         shutdown_on_any_exit,

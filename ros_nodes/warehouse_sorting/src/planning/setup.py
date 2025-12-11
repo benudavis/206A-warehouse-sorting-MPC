@@ -28,6 +28,7 @@ setup(
             'ik = planning.ik:main',
             'transform_perception = planning.transform_perception:main',
             'forward_kinematics_node = planning.forward_kinematics_node:main',
+            'mpc_visualization = planning.mpc_visualization_node:main',
         ],
     },
 )
