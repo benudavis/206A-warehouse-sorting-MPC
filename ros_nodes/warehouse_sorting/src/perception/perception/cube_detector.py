@@ -55,6 +55,7 @@ class RealSensePCSubscriber(Node):
 
         # Track if obstacle has been published (only publish once to avoid EE being detected as obstacle)
         self.obstacle_published = False
+        self.obstacle_cluster_id = None  # Track which cluster was published as obstacle
 
         self.get_logger().info("Subscribed to PointCloud2 topic and marker publisher ready")
 
@@ -121,88 +122,86 @@ class RealSensePCSubscriber(Node):
 
         cube_list = []
         labeled_cube_list = []
-        cluster_sizes = []
         MIN_CLUSTER_POINTS = 100
 
         for label in range(max_label + 1):
             indices = np.where(labels == label)[0]
 
             if len(indices) < MIN_CLUSTER_POINTS:
-                continue  # skipping to next label
-
-            cluster_sizes.append(len(indices))
+                continue
 
             cluster = pcd.select_by_index(indices)
             cluster_points = np.asarray(cluster.points)
             cluster_colors = np.asarray(cluster.colors)
 
             cluster_color = np.mean(cluster_colors, axis=0)
-
-            # Color Classification
             cube_label = self.classify_color(cluster_color)
 
-            # Compute position of the cube via remaining points
             centroid = np.mean(cluster_points, axis=0)
             cube_x = float(centroid[0])
             cube_y = float(centroid[1])
             cube_z = float(centroid[2])
 
-            cube = CubeMsg()
-            cube.color.r = cluster_color[0]
-            cube.color.g = cluster_color[1]
-            cube.color.b = cluster_color[2]
-            cube.color.a = 1.0
-            cube.point.header = msg.header
-            cube.point.point.x = cube_x
-            cube.point.point.y = cube_y
-            cube.point.point.z = cube_z
+            # Classify based on color: Green = Obstacle, Red/Blue = Cube
+            if cube_label == "green":
+                # This is an obstacle - publish bounding box
+                # Only publish once to avoid detecting the end-effector as an obstacle
+                if not self.obstacle_published or self.obstacle_cluster_id != label:
+                    x_box = cluster_points[:, 0]
+                    y_box = cluster_points[:, 1]
+                    z_box = cluster_points[:, 2]
 
-            # Only publish obstacle once to avoid detecting the end-effector as an obstacle
-            if len(indices) > 10000 and not self.obstacle_published:
-                x_box = cluster_points[:, 0]
-                y_box = cluster_points[:, 1]
-                z_box = cluster_points[:, 2]
+                    x_box_min, x_box_max = x_box.min(), x_box.max()
+                    y_box_min, y_box_max = y_box.min(), y_box.max()
+                    z_box_min, z_box_max = z_box.min(), z_box.max()
 
-                x_box_min, x_box_max = x_box.min(), x_box.max()
-                y_box_min, y_box_max = y_box.min(), y_box.max()
-                z_box_min, z_box_max = z_box.min(), z_box.max()
+                    marker = Marker()
+                    marker.header = msg.header
+                    marker.ns = "bounding_boxes"
+                    marker.id = label
+                    marker.type = Marker.CUBE
+                    marker.action = Marker.ADD
+                    marker.pose.position.x = (x_box_min + x_box_max) / 2.0
+                    marker.pose.position.y = (y_box_min + y_box_max) / 2.0
+                    marker.pose.position.z = (z_box_min + z_box_max) / 2.0
+                    marker.pose.orientation.w = 1.0
+                    marker.scale.x = float(x_box_max - x_box_min)
+                    marker.scale.y = float(y_box_max - y_box_min)
+                    marker.scale.z = float(z_box_max - z_box_min)
 
-                marker = Marker()
-                marker.header = msg.header
-                marker.ns = "bounding_boxes"
-                marker.id = label
-                marker.type = Marker.CUBE
-                marker.action = Marker.ADD
-                marker.pose.position.x = (x_box_min + x_box_max) / 2.0
-                marker.pose.position.y = (y_box_min + y_box_max) / 2.0
-                marker.pose.position.z = (z_box_min + z_box_max) / 2.0
-                marker.pose.orientation.w = 1.0
-                marker.scale.x = float(x_box_max - x_box_min)
-                marker.scale.y = float(y_box_max - y_box_min)
-                marker.scale.z = float(z_box_max - z_box_min)
+                    marker.color.r = 0.0
+                    marker.color.g = 1.0
+                    marker.color.b = 0.0
+                    marker.color.a = 0.3
 
-                # Set Color (e.g., Green with transparency)
-                marker.color.r = 0.0
-                marker.color.g = 1.0
-                marker.color.b = 0.0
-                marker.color.a = 0.3  # 30% opaque
+                    self.obstacle_marker_pub.publish(marker)
+                    self.get_logger().info(f"Published obstacle marker for green cluster {label} (size: {len(indices)}).")
 
-                self.obstacle_marker_pub.publish(marker)
-                self.get_logger().info(f"Published CUBE Marker for cluster {label}.")
+                    obstacle_msg = BoxBounds()
+                    obstacle_msg.x_min = float(x_box_min)
+                    obstacle_msg.x_max = float(x_box_max)
+                    obstacle_msg.y_min = float(y_box_min)
+                    obstacle_msg.y_max = float(y_box_max)
+                    obstacle_msg.z_min = float(z_box_min)
+                    obstacle_msg.z_max = float(z_box_max)
 
-                obstacle_msg = BoxBounds()
-                obstacle_msg.x_min = float(x_box_min)
-                obstacle_msg.x_max = float(x_box_max)
-                obstacle_msg.y_min = float(y_box_min)
-                obstacle_msg.y_max = float(y_box_max)
-                obstacle_msg.z_min = float(z_box_min)
-                obstacle_msg.z_max = float(z_box_max)
+                    self.obstacles_pub.publish(obstacle_msg)
+                    self.obstacle_published = True
+                    self.obstacle_cluster_id = label
+                    self.get_logger().info(f"Published obstacle bounding box for green cluster {label}.")
 
-                self.obstacles_pub.publish(obstacle_msg)
-                self.obstacle_published = True  # Mark as published to prevent future updates
-                self.get_logger().info(f"Published Bounding Box for large cluster (size: {len(indices)}). Obstacle will not be updated again.")
+            elif cube_label in ["red", "blue"]:
+                # This is a cube - publish as cube
+                cube = CubeMsg()
+                cube.color.r = cluster_color[0]
+                cube.color.g = cluster_color[1]
+                cube.color.b = cluster_color[2]
+                cube.color.a = 1.0
+                cube.point.header = msg.header
+                cube.point.point.x = cube_x
+                cube.point.point.y = cube_y
+                cube.point.point.z = cube_z
 
-            else:
                 cube_list.append(cube)
 
                 labeled_cube = LabeledCube()
@@ -213,6 +212,11 @@ class RealSensePCSubscriber(Node):
                 labeled_cube.color_label = cube_label
 
                 labeled_cube_list.append(labeled_cube)
+                self.get_logger().debug(f"Published {cube_label} cube at ({cube_x:.3f}, {cube_y:.3f}, {cube_z:.3f})")
+
+            else:
+                # Unknown color - skip or could be treated as obstacle
+                self.get_logger().debug(f"Skipping cluster {label} with unknown color (size: {len(indices)})")
 
         self.publish_filtered_points(filtered_points, msg.header)
 

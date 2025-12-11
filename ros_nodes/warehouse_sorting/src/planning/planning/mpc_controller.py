@@ -98,7 +98,7 @@ def build_ur7e_fk_function():
         # Rotation matrix using Rodrigues' formula: R = I + sin(θ)*ω_hat + (1-cos(θ))*ω_hat^2
         I3 = ca.SX_eye(3)
         R = I3 + ca.sin(theta) * omega_hat + (1 - ca.cos(theta)) * (omega_hat @ omega_hat)
-        
+
         # Translation vector: p = V * v where V = I*θ + (1-cos(θ))*ω_hat + (θ-sin(θ))*ω_hat^2
         V = I3 * theta + (1 - ca.cos(theta)) * omega_hat + (theta - ca.sin(theta)) * (omega_hat @ omega_hat)
         p = V @ v
@@ -167,7 +167,10 @@ class MPCController:
         # Obstacles: list of (center[3], half_size[3]) in base_link frame
         self.obstacles = []
         self.n_max_obstacles = 10
-        self.safety_margin = 0.12  # [m]
+        self.safety_margin = 0.0  # [m] - Set to 0 to allow reaching target
+
+        # Minimum z constraint (for table avoidance after picking)
+        self.minimum_z = None  # [m] - None means disabled, otherwise enforces ee_z >= minimum_z
 
         # Analytic FK - always required for EE collision avoidance
         try:
@@ -199,6 +202,33 @@ class MPCController:
         self.max_velocity = float(max_vel)
         self.prev_solution = None
         self._setup_optimization()
+    
+    def set_safety_margin(self, margin):
+        """
+        Set safety margin for obstacle avoidance (soft penalty zone).
+        Larger values encourage staying further from obstacles.
+        
+        Args:
+            margin: Safety margin [m]. 0.0 = no soft penalty (only hard constraint).
+                   Typical values: 0.05-0.15m for going over obstacles.
+        """
+        self.safety_margin = float(margin)
+        self.prev_solution = None
+        self._setup_optimization()
+        print(f"Set safety margin: {margin:.3f} m")
+    
+    def set_obstacle_weight(self, weight):
+        """
+        Set obstacle avoidance cost weight.
+        Higher values make obstacle avoidance more important relative to target tracking.
+        
+        Args:
+            weight: Obstacle cost weight. Default is 1e4. Higher = more avoidance.
+        """
+        self.obstacle_weight = float(weight)
+        self.prev_solution = None
+        self._setup_optimization()
+        print(f"Set obstacle weight: {weight:.2e}")
 
     def add_obstacle(self, position, size):
         """
@@ -215,6 +245,29 @@ class MPCController:
     def clear_obstacles(self):
         self.obstacles = []
         print("Cleared all obstacles from MPC")
+    
+    def set_minimum_z(self, z_min):
+        """
+        Set minimum z constraint for end-effector (hard constraint).
+        Prevents end-effector from going below this height.
+        
+        Args:
+            z_min: Minimum z coordinate [m] in base_link frame. None to disable.
+        """
+        self.minimum_z = float(z_min) if z_min is not None else None
+        self.prev_solution = None
+        self._setup_optimization()
+        if z_min is not None:
+            print(f"Set minimum z constraint: {z_min:.3f} m")
+        else:
+            print("Cleared minimum z constraint")
+    
+    def clear_minimum_z(self):
+        """Clear minimum z constraint (disable it)."""
+        self.minimum_z = None
+        self.prev_solution = None
+        self._setup_optimization()
+        print("Cleared minimum z constraint")
 
     # ------------------------------------------------------------------
     # Optimization problem
@@ -299,12 +352,36 @@ class MPCController:
                 lbg.append(-1e3)
                 ubg.append(0.0)  # must not be strictly inside
 
-                # Soft cost: penalize getting too close to obstacles (within safety margin)
-                inflated = half_size + self.safety_margin
-                u_margin = ca.fabs(diff) - inflated
-                pen_vec = ca.fmin(0, u_margin)
-                pen_mag = ca.sqrt(ca.sumsqr(pen_vec))
-                cost += active_mask * self.obstacle_weight * pen_mag ** 2
+                # Hard constraint: EE must not be inside safety margin zone (if safety_margin > 0)
+                if self.safety_margin > 0:
+                    inflated = half_size + self.safety_margin
+                    inside_safety_clearances = inflated - ca.fabs(diff)
+                    min_inside_safety = inside_safety_clearances[0]
+                    min_inside_safety = ca.fmin(min_inside_safety, inside_safety_clearances[1])
+                    min_inside_safety = ca.fmin(min_inside_safety, inside_safety_clearances[2])
+                    
+                    g_safety = active_mask * min_inside_safety
+                    constraints.append(g_safety)
+                    lbg.append(-1e3)
+                    ubg.append(0.0)  # must not be inside safety margin zone
+                    
+                    # When safety_margin is a hard constraint, we disable the soft penalty
+                    # to avoid double-penalizing and allow the MPC to reach targets that satisfy constraints
+                    # (Soft cost is only used when safety_margin = 0 for soft avoidance behavior)
+                else:
+                    # Soft cost: only used when safety_margin = 0 (soft avoidance, no hard constraint)
+                    # When safety_margin > 0, we rely on the hard constraint only
+                    u_margin = ca.fabs(diff) - half_size
+                    pen_vec = ca.fmin(0, u_margin)
+                    pen_mag = ca.sqrt(ca.sumsqr(pen_vec))
+                    cost += active_mask * self.obstacle_weight * pen_mag ** 2
+            
+            # Minimum z constraint (hard constraint: prevent going below table after picking)
+            if self.minimum_z is not None:
+                ee_z = ee_pos_k[2]  # z-coordinate of end-effector
+                constraints.append(ee_z)
+                lbg.append(self.minimum_z)  # ee_z >= minimum_z
+                ubg.append(1e3)  # No upper bound
 
         # Variable bounds (joint limits)
         lbx = []
