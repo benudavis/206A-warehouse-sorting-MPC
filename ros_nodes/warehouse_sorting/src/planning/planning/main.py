@@ -27,12 +27,25 @@ class UR7e_CubeGrasp(Node):
 
         super().__init__('cube_grasp')
 
+        # Subscribe to transformed cubes in base_link frame
+        # Note: This requires transform_perception node to be running
         self.labeled_cubes_sub = self.create_subscription(
             LabeledCubeArray,
             '/labeled_cubes_base',
             self.labeled_cubes_callback,
             10
         )
+        
+        # Also subscribe to raw cubes as fallback (for debugging)
+        self.labeled_cubes_raw_sub = self.create_subscription(
+            LabeledCubeArray,
+            '/labeled_cubes',
+            self.labeled_cubes_raw_callback,
+            10
+        )
+        
+        self.get_logger().info("Subscribed to /labeled_cubes_base (transformed to base_link)")
+        self.get_logger().info("Also subscribed to /labeled_cubes (raw, camera frame) for diagnostics")
 
         self.obstacles_sub = self.create_subscription(
             BoxBounds,
@@ -99,16 +112,28 @@ class UR7e_CubeGrasp(Node):
             self.initial_joint_state.velocity = list(msg.velocity) if msg.velocity else []
             self.initial_joint_state.effort = list(msg.effort) if msg.effort else []
             self.get_logger().info("Stored initial/home joint state")
+            self.get_logger().info("Node is ready. Waiting for cube detections on /labeled_cubes_base...")
+            self.get_logger().info("Make sure transform_perception node is running to transform /labeled_cubes -> /labeled_cubes_base")
 
+    def labeled_cubes_raw_callback(self, msg: LabeledCubeArray):
+        """Diagnostic callback for raw cubes in camera frame."""
+        if len(msg.cubes) > 0:
+            self.get_logger().info(
+                f"[DIAGNOSTIC] Received {len(msg.cubes)} cube(s) on /labeled_cubes (camera frame). "
+                f"transform_perception node should transform these to /labeled_cubes_base"
+            )
+    
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
         """Process detected cubes and queue them for picking."""
         if self.joint_state is None:
-            self.get_logger().debug("No joint state yet, skipping cube processing")
+            self.get_logger().warn("No joint state yet, skipping cube processing")
             return
 
         if self.processing_cube:
             self.get_logger().debug("Already processing a cube, skipping new detections")
             return
+        
+        self.get_logger().info(f"Received {len(msg.cubes)} cube(s) on /labeled_cubes_base (base_link frame)")
 
         for i, labeled_cube in enumerate(msg.cubes):
             if labeled_cube.color_label not in ['red', 'blue']:
