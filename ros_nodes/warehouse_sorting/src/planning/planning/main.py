@@ -14,6 +14,13 @@ from planning.ik import IKPlanner
 from planning.mpc_controller import MPCController
 from planning.forward_kinematics import ur7e_forward_kinematics_from_angles
 
+# Try to import scipy for smooth trajectory interpolation
+try:
+    from scipy.interpolate import interp1d
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 class UR7e_CubeGrasp(Node):
 
     def __init__(self):
@@ -66,6 +73,10 @@ class UR7e_CubeGrasp(Node):
         safety_margin = 0.10
         self.mpc.set_safety_margin(safety_margin)
         self.get_logger().info(f"MPC configured with safety_margin={safety_margin:.3f}m (hard constraint)")
+        
+        # Trajectory smoothing parameters
+        self.smoothing_points_per_segment = self.declare_parameter('smoothing_points_per_segment', 5).value
+        self.get_logger().info(f"Trajectory smoothing: {self.smoothing_points_per_segment} points per segment (scipy available: {HAS_SCIPY})")
 
         self.mpc_traj_pub = self.create_publisher(
             DisplayTrajectory,
@@ -299,6 +310,135 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().error("Unknown job type.")
             self.execute_jobs()
 
+    def _smooth_trajectory(self, joint_traj: JointTrajectory) -> JointTrajectory:
+        """
+        Apply smooth cubic spline interpolation to a joint trajectory.
+        Adds intermediate waypoints between existing points for smoother execution.
+        
+        Args:
+            joint_traj: Input JointTrajectory message
+            
+        Returns:
+            Smoothed JointTrajectory with interpolated waypoints
+        """
+        if len(joint_traj.points) < 2:
+            # Not enough points to interpolate, return as-is
+            return joint_traj
+        
+        if not HAS_SCIPY:
+            # Scipy not available, return original trajectory
+            self.get_logger().debug("Scipy not available, skipping trajectory smoothing")
+            return joint_traj
+        
+        # Extract time stamps and positions
+        n_joints = len(joint_traj.joint_names)
+        n_points = len(joint_traj.points)
+        
+        # Convert time_from_start to seconds
+        times = []
+        positions = []
+        velocities = []
+        
+        for pt in joint_traj.points:
+            t_sec = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
+            times.append(t_sec)
+            positions.append(np.array(pt.positions))
+            velocities.append(np.array(pt.velocities) if len(pt.velocities) == n_joints else np.zeros(n_joints))
+        
+        times = np.array(times)
+        positions = np.array(positions)  # Shape: (n_points, n_joints)
+        velocities = np.array(velocities)  # Shape: (n_points, n_joints)
+        
+        # Create interpolated time points
+        # Add intermediate points between each pair of original points
+        n_interp = self.smoothing_points_per_segment
+        interp_times = []
+        
+        for i in range(n_points - 1):
+            t_start = times[i]
+            t_end = times[i + 1]
+            # Create segment with intermediate points (n_interp+1 points total, including endpoints)
+            segment_times = np.linspace(t_start, t_end, n_interp + 1)
+            if i == 0:
+                # First segment: include all points (start + intermediates)
+                interp_times.extend(segment_times)
+            else:
+                # Subsequent segments: skip first point to avoid duplicates with previous segment's end
+                interp_times.extend(segment_times[1:])
+        
+        # Final point should already be included from the last segment, but verify
+        interp_times = np.array(interp_times)
+        
+        # Remove any duplicates (within numerical precision)
+        if len(interp_times) > 1:
+            # Keep points where time difference is significant
+            unique_mask = np.ones(len(interp_times), dtype=bool)
+            for i in range(1, len(interp_times)):
+                if abs(interp_times[i] - interp_times[i-1]) < 1e-9:
+                    unique_mask[i] = False
+            interp_times = interp_times[unique_mask]
+        
+        # Interpolate each joint independently
+        interp_positions = np.zeros((len(interp_times), n_joints))
+        interp_velocities = np.zeros((len(interp_times), n_joints))
+        
+        # Choose interpolation method based on number of points
+        if n_points >= 4:
+            kind = 'cubic'
+        elif n_points >= 2:
+            kind = 'linear'
+        else:
+            kind = 'linear'
+        
+        try:
+            for j in range(n_joints):
+                # Interpolate positions
+                f_pos = interp1d(times, positions[:, j], kind=kind, 
+                                bounds_error=False, fill_value='extrapolate')
+                interp_positions[:, j] = f_pos(interp_times)
+                
+                # Interpolate velocities (if available)
+                if np.any(np.abs(velocities[:, j]) > 1e-6):  # Check if velocities are non-zero
+                    f_vel = interp1d(times, velocities[:, j], kind=kind,
+                                    bounds_error=False, fill_value='extrapolate')
+                    interp_velocities[:, j] = f_vel(interp_times)
+                else:
+                    # Compute velocities from position differences
+                    for k in range(len(interp_times)):
+                        if k < len(interp_times) - 1:
+                            dt = interp_times[k + 1] - interp_times[k]
+                            if dt > 1e-6:
+                                interp_velocities[k, j] = (interp_positions[k + 1, j] - interp_positions[k, j]) / dt
+                        elif k > 0:
+                            dt = interp_times[k] - interp_times[k - 1]
+                            if dt > 1e-6:
+                                interp_velocities[k, j] = (interp_positions[k, j] - interp_positions[k - 1, j]) / dt
+        except Exception as e:
+            self.get_logger().warn(f"Trajectory interpolation failed: {e}. Using original trajectory.")
+            return joint_traj
+        
+        # Create new smoothed trajectory
+        smoothed_traj = JointTrajectory()
+        smoothed_traj.joint_names = list(joint_traj.joint_names)
+        smoothed_traj.header = joint_traj.header
+        
+        from builtin_interfaces.msg import Duration
+        
+        for k, t in enumerate(interp_times):
+            pt = JointTrajectoryPoint()
+            pt.positions = interp_positions[k].tolist()
+            pt.velocities = interp_velocities[k].tolist()
+            
+            secs = int(t)
+            nsecs = int((t - secs) * 1e9)
+            pt.time_from_start = Duration(sec=secs, nanosec=nsecs)
+            
+            smoothed_traj.points.append(pt)
+        
+        self.get_logger().debug(f"Smoothed trajectory: {n_points} -> {len(smoothed_traj.points)} points")
+        
+        return smoothed_traj
+    
     def _compute_end_effector_z(self, joint_state: JointState) -> float:
         """
         Compute end-effector z-coordinate from joint state using forward kinematics.
@@ -394,9 +534,12 @@ class UR7e_CubeGrasp(Node):
             
             jt.points.append(pt)
         
-        self._publish_mpc_trajectory(current_js, jt)
+        # Apply smooth interpolation to the trajectory
+        jt_smooth = self._smooth_trajectory(jt)
         
-        return jt
+        self._publish_mpc_trajectory(current_js, jt_smooth)
+        
+        return jt_smooth
 
     def _publish_mpc_trajectory(self, current_js: JointState, joint_traj: JointTrajectory):
         """

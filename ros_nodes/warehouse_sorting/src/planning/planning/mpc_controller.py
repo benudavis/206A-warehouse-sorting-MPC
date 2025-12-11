@@ -365,6 +365,27 @@ class MPCController:
                     lbg.append(-1e3)
                     ubg.append(0.0)  # must not be inside safety margin zone
                     
+                    # Additional constraint: If EE is within obstacle's XY projection (with safety margin),
+                    # it MUST be above the obstacle's top (go over, not around)
+                    # Check if point is within XY bounds of inflated obstacle
+                    diff_xy = diff[:2]  # X and Y components
+                    inside_xy = ca.fabs(diff_xy) - (half_size[:2] + self.safety_margin)
+                    # inside_xy[i] < 0 means inside XY bounds
+                    inside_xy_x = inside_xy[0] < 0
+                    inside_xy_y = inside_xy[1] < 0
+                    within_xy_bounds = ca.if_else(inside_xy_x * inside_xy_y, 1.0, 0.0)  # Both X and Y must be inside
+                    
+                    # If within XY bounds, EE must be above obstacle top
+                    obstacle_top = center[2] + half_size[2] + self.safety_margin
+                    ee_z = ee_pos_k[2]
+                    # Constraint: if within_xy_bounds, then ee_z >= obstacle_top
+                    # We enforce: (1 - within_xy_bounds) * large_value + within_xy_bounds * (obstacle_top - ee_z) <= 0
+                    # This means: if within_xy_bounds, then ee_z >= obstacle_top
+                    g_over_obstacle = active_mask * within_xy_bounds * (obstacle_top - ee_z)
+                    constraints.append(g_over_obstacle)
+                    lbg.append(-1e3)
+                    ubg.append(0.0)  # If within XY bounds, must have ee_z >= obstacle_top
+                    
                     # When safety_margin is a hard constraint, we disable the soft penalty
                     # to avoid double-penalizing and allow the MPC to reach targets that satisfy constraints
                     # (Soft cost is only used when safety_margin = 0 for soft avoidance behavior)
