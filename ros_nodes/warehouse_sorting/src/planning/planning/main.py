@@ -68,6 +68,7 @@ class UR7e_CubeGrasp(Node):
         self.cube_queue = []
         self.processing_cube = False
         self.processed_cube_ids = set()
+        self.queued_cube_positions = set()  # Track cube positions already in queue
         self.obstacle_top_z = None
         self.clearance_height = 0.35
         self.clearance_margin = 0.10
@@ -93,6 +94,11 @@ class UR7e_CubeGrasp(Node):
         """Route cubes to drop locations based on color (red/blue)."""
         if self.joint_state is None:
             self.get_logger().debug("No joint state yet, skipping cube processing")
+            return
+
+        # Skip processing if we're currently handling a cube to prevent position updates
+        if self.processing_cube:
+            self.get_logger().debug("Currently processing a cube, skipping new detections to prevent position updates")
             return
 
         for labeled_cube in msg.cubes:
@@ -123,8 +129,10 @@ class UR7e_CubeGrasp(Node):
             cube_y = cube_pose_base.point.y
             cube_z = cube_pose_base.point.z
 
+            # Check if this cube is already in the queue or has been processed
             cube_id = f"{cube_x:.3f}_{cube_y:.3f}_{cube_z:.3f}"
             
+            # Check if already processed
             if cube_id in self.processed_cube_ids:
                 found_similar = False
                 for existing_id in self.processed_cube_ids:
@@ -141,6 +149,20 @@ class UR7e_CubeGrasp(Node):
                 
                 if found_similar:
                     continue
+
+            # Check if already in queue (to prevent duplicates from camera updates)
+            already_queued = False
+            for queued_cube_pose, _, _ in self.cube_queue:
+                queued_x = queued_cube_pose.point.x
+                queued_y = queued_cube_pose.point.y
+                queued_z = queued_cube_pose.point.z
+                dist = np.sqrt((cube_x - queued_x)**2 + (cube_y - queued_y)**2 + (cube_z - queued_z)**2)
+                if dist < 0.05:  # Within 5cm, consider it the same cube
+                    already_queued = True
+                    break
+            
+            if already_queued:
+                continue
 
             if labeled_cube.color_label == 'red':
                 drop_location = self.red_drop_location
@@ -261,7 +283,18 @@ class UR7e_CubeGrasp(Node):
             f"({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f}) via clearance z={move_up_z:.3f}m"
         )
 
+        # Ensure we're at the exact drop location before releasing
+        drop_js = self.ik_planner.compute_ik(self.joint_state, drop_x, drop_y, drop_z)
+        if drop_js is None:
+            self.get_logger().error("IK failed for final drop pose.")
+            self.processing_cube = False
+            return
+        self.job_queue.append(drop_js)
+        self.get_logger().info(f"Added final drop position at ({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f})")
+
+        # Release the gripper at drop location
         self.job_queue.append('toggle_grip')
+        self.get_logger().info("Added gripper release command")
         
         if self.initial_joint_state is not None:
             self.job_queue.append(('return_home', self.initial_joint_state))
