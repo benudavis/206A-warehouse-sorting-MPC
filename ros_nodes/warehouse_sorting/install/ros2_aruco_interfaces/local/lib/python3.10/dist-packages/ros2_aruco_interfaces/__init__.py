@@ -1,0 +1,1 @@
+/home/cc/ee106a/fa25/class/ee106a-ahq/project/206A-warehouse-sorting-MPC/ros_nodes/warehouse_sorting/build/ros2_aruco_interfaces/rosidl_generator_py/ros2_aruco_interfaces/__init__.py

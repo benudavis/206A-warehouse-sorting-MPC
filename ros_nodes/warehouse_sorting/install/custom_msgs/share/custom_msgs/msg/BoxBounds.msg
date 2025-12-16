@@ -1,0 +1,1 @@
+/home/cc/ee106a/fa25/class/ee106a-ahq/project/206A-warehouse-sorting-MPC/ros_nodes/warehouse_sorting/src/custom_msgs/msg/BoxBounds.msg
