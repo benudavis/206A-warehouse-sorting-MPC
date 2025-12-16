@@ -166,6 +166,7 @@ class TransformPerception(Node):
         else:
             source_frame = self.camera_frame_id
 
+
         # Extrapolate z_min and z_max in camera frame before transformation
         # Extend the z range to make the obstacle larger in camera's z direction
         z_extrapolation = 0.8  # meters - extend obstacle depth/height in camera z direction
@@ -175,14 +176,14 @@ class TransformPerception(Node):
         # Transform the 8 corners of the bounding box from camera frame to base_link
         # This is the most accurate way to handle rotations
         corners_camera = np.array([
-            [msg.x_min, msg.y_min, z_min_extended],
-            [msg.x_max, msg.y_min, z_min_extended],
-            [msg.x_min, msg.y_max, z_min_extended],
-            [msg.x_max, msg.y_max, z_min_extended],
-            [msg.x_min, msg.y_min, z_max_extended],
-            [msg.x_max, msg.y_min, z_max_extended],
-            [msg.x_min, msg.y_max, z_max_extended],
-            [msg.x_max, msg.y_max, z_max_extended],
+            [msg.x_min, msg.y_min, msg.z_min],
+            [msg.x_max, msg.y_min, msg.z_min],
+            [msg.x_min, msg.y_max, msg.z_min],
+            [msg.x_max, msg.y_max, msg.z_min],
+            [msg.x_min, msg.y_min, msg.z_max],
+            [msg.x_max, msg.y_min, msg.z_max],
+            [msg.x_min, msg.y_max, msg.z_max],
+            [msg.x_max, msg.y_max, msg.z_max],
         ])
 
         # Get transform from camera frame to base_link
@@ -220,10 +221,11 @@ class TransformPerception(Node):
         corners_base = np.array(corners_base)
 
         # Compute new bounding box in base_link frame
+        # extend along y axis
         x_min_base = float(np.min(corners_base[:, 0]))
         x_max_base = float(np.max(corners_base[:, 0]))
-        y_min_base = float(np.min(corners_base[:, 1]))
-        y_max_base = float(np.max(corners_base[:, 1]))
+        y_min_base = float(np.min(corners_base[:, 1])) - 0.5
+        y_max_base = float(np.max(corners_base[:, 1])) + 0.5
         z_min_base = float(np.min(corners_base[:, 2]))
         z_max_base = float(np.max(corners_base[:, 2]))
 

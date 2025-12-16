@@ -19,7 +19,7 @@ class StaticTFNode(Node):
         super().__init__('static_tf_node')
 
         # Parameter: which AR marker to use as parent frame
-        self.declare_parameter('ar_marker', 'ar_marker_7')
+        self.declare_parameter('ar_marker', 'ar_marker_8')
         marker_frame = self.get_parameter('ar_marker') \
                              .get_parameter_value() \
                              .string_value

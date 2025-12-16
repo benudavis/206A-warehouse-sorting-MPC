@@ -23,7 +23,8 @@ setup(
     entry_points={
         'console_scripts': [
             # Main executable (uses MPC for trajectory planning)
-            'main = planning.main:main',
+            'main_mpc = planning.main_mpc:main',
+            'main_waypoints = planning.main_waypoints:main',
             'tf = planning.static_tf_transform:main',
             'ik = planning.ik:main',
             'transform_perception = planning.transform_perception:main',
