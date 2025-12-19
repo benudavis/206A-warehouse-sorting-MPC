@@ -5,21 +5,22 @@ from rclpy.action import ActionClient
 
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PointStamped
-from moveit_msgs.msg import RobotTrajectory
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
 from custom_msgs.msg import LabeledCubeArray, LabeledCube, BoxBounds
+
 from planning.ik import IKPlanner
+
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
 from rclpy.time import Time
+
 import numpy as np
 
 
 class UR7e_CubeGrasp(Node):
 
     def __init__(self):
-
         super().__init__('cube_grasp')
 
         # Subscriptions
@@ -53,21 +54,21 @@ class UR7e_CubeGrasp(Node):
         # Service client for gripper (toggle)
         self.gripper_cli = self.create_client(Trigger, '/toggle_gripper')
 
-        # TF
+        # TF (fallback only; transform_perception should already publish in base_link)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Fixed drop locations in base_link frame
         self.red_drop_location = PointStamped()
         self.red_drop_location.header.frame_id = "base_link"
-        self.red_drop_location.point.x = -0.35
-        self.red_drop_location.point.y = 0.50
+        self.red_drop_location.point.x = -0.37
+        self.red_drop_location.point.y = 0.47
         self.red_drop_location.point.z = 0.0
 
         self.blue_drop_location = PointStamped()
         self.blue_drop_location.header.frame_id = "base_link"
-        self.blue_drop_location.point.x = -0.35
-        self.blue_drop_location.point.y = 0.74
+        self.blue_drop_location.point.x = -0.37
+        self.blue_drop_location.point.y = 0.68
         self.blue_drop_location.point.z = 0.0
 
         # State
@@ -75,7 +76,7 @@ class UR7e_CubeGrasp(Node):
         self.initial_joint_state = None
         self.cube_queue = []         # list of (PointStamped, color, drop_location)
         self.processing_cube = False
-        self.completed_cubes = []    # list of (x, y, z) that have been successfully processed
+        self.completed_cubes = []    # list of (x, y, z) successfully processed
         self.current_cube_pose = None
         self.current_cube_color = None
         self.obstacle_top_z = None
@@ -84,7 +85,9 @@ class UR7e_CubeGrasp(Node):
 
         self.ik_planner = IKPlanner()
         self.job_queue = []          # list of JointState | 'toggle_grip' | ('return_home', JointState)
-        self.smooth_waypoints_count = 3
+        self.smooth_waypoints_count = 5
+
+        self.get_logger().info("main_waypoints node started")
 
     # --------------------------------------------------------------------------
     # Callbacks
@@ -104,7 +107,7 @@ class UR7e_CubeGrasp(Node):
             self.get_logger().info("Node is ready. Waiting for cube detections...")
 
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
-        """Route cubes to drop locations based on color (red/blue)."""
+        """Route cubes to drop locations based on color (red/black)."""
         if self.joint_state is None:
             self.get_logger().debug("No joint state yet, skipping cube processing")
             return
@@ -126,15 +129,17 @@ class UR7e_CubeGrasp(Node):
             if not cube_pose_stamped.header.frame_id:
                 cube_pose_stamped.header.frame_id = "base_link"
 
+            # Match your original “correct” TF style:
+            # stamp with now, then (if needed) lookup latest transform using Time()
             cube_pose_stamped.header.stamp = self.get_clock().now().to_msg()
 
-            # Transform to base_link if needed
+            # Transform to base_link if needed (fallback; ideally already base_link)
             if cube_pose_stamped.header.frame_id != "base_link":
                 try:
                     transform = self.tf_buffer.lookup_transform(
                         "base_link",
                         cube_pose_stamped.header.frame_id,
-                        Time()
+                        Time()  # latest available transform (matches your original)
                     )
                     cube_pose_base = do_transform_point(cube_pose_stamped, transform)
                 except Exception as e:
@@ -151,35 +156,18 @@ class UR7e_CubeGrasp(Node):
             cube_z = cube_pose_base.point.z
 
             # Skip cubes that are very close to ones we've already successfully processed
-            skip_due_to_completed = False
-            for px, py, pz in self.completed_cubes:
-                dist = np.sqrt((cube_x - px) ** 2 + (cube_y - py) ** 2 + (cube_z - pz) ** 2)
-                if dist < 0.05:  # within 5 cm of a completed cube
-                    skip_due_to_completed = True
-                    break
-            if skip_due_to_completed:
+            if self._is_near_completed(cube_x, cube_y, cube_z):
                 continue
 
             # Skip cubes that are already in the queue (camera updates)
-            already_queued = False
-            for queued_cube_pose, _, _ in self.cube_queue:
-                qx = queued_cube_pose.point.x
-                qy = queued_cube_pose.point.y
-                qz = queued_cube_pose.point.z
-                dist = np.sqrt((cube_x - qx) ** 2 + (cube_y - qy) ** 2 + (cube_z - qz) ** 2)
-                if dist < 0.05:  # within 5cm, consider same cube
-                    already_queued = True
-                    break
-            if already_queued:
+            if self._is_already_queued(cube_x, cube_y, cube_z):
                 continue
 
             # Choose drop location by color
             if labeled_cube.color_label == 'red':
                 drop_location = self.red_drop_location
-            elif labeled_cube.color_label == 'black':
+            else:  # 'black'
                 drop_location = self.blue_drop_location
-            else:
-                continue
 
             self.cube_queue.append((cube_pose_base, labeled_cube.color_label, drop_location))
 
@@ -193,6 +181,23 @@ class UR7e_CubeGrasp(Node):
         # Start processing if not currently busy
         if self.cube_queue and not self.processing_cube:
             self._process_next_cube()
+
+    def _is_near_completed(self, x, y, z, thresh=0.05) -> bool:
+        for px, py, pz in self.completed_cubes:
+            dist = np.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
+            if dist < thresh:
+                return True
+        return False
+
+    def _is_already_queued(self, x, y, z, thresh=0.05) -> bool:
+        for queued_cube_pose, _, _ in self.cube_queue:
+            qx = queued_cube_pose.point.x
+            qy = queued_cube_pose.point.y
+            qz = queued_cube_pose.point.z
+            dist = np.sqrt((x - qx) ** 2 + (y - qy) ** 2 + (z - qz) ** 2)
+            if dist < thresh:
+                return True
+        return False
 
     def obstacles_callback(self, msg: BoxBounds):
         """Update obstacle clearance height for trajectory planning."""
@@ -228,10 +233,7 @@ class UR7e_CubeGrasp(Node):
         )
 
         if not self._build_cube_job_queue(cube_pose, drop_location):
-            # Failed to build job queue; reset state and move on to next cube if any
-            self.get_logger().warn(
-                "Failed to build job queue for cube; skipping to next cube if available."
-            )
+            self.get_logger().warn("Failed to build job queue for cube; skipping.")
             self.processing_cube = False
             self.current_cube_pose = None
             self.current_cube_color = None
@@ -241,8 +243,7 @@ class UR7e_CubeGrasp(Node):
 
         self.execute_jobs()
 
-    def _build_cube_job_queue(self, cube_pose: PointStamped,
-                              drop_location: PointStamped) -> bool:
+    def _build_cube_job_queue(self, cube_pose: PointStamped, drop_location: PointStamped) -> bool:
         """
         Build job queue:
         pre-grasp → grasp → grip → smooth arc to drop → final drop → release → home.
@@ -321,34 +322,26 @@ class UR7e_CubeGrasp(Node):
             f"({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f}) via clearance z={move_up_z:.3f}m"
         )
 
-        # Ensure we're at the exact drop location before releasing
+        # Final drop pose
         drop_js = self.ik_planner.compute_ik(self.joint_state, drop_x, drop_y, drop_z)
         if drop_js is None:
             self.get_logger().error("IK failed for final drop pose.")
             self.job_queue = []
             return False
         self.job_queue.append(drop_js)
-        self.get_logger().info(
-            f"Added final drop position at ({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f})"
-        )
 
-        # Release the gripper at drop location (open)
+        # Release gripper
         self.job_queue.append('toggle_grip')
-        self.get_logger().info("Added gripper release command")
 
-        # Return to home if available
+        # Return home
         if self.initial_joint_state is not None:
             self.job_queue.append(('return_home', self.initial_joint_state))
-            self.get_logger().info("Added return to home position after cube processing")
         else:
-            self.get_logger().warn(
-                "Initial joint state not available, skipping return to home"
-            )
+            self.get_logger().warn("Initial joint state not available, skipping return to home")
 
         return True
 
-    def _generate_smooth_waypoints(self, start_pos, end_pos,
-                                   clearance_z, num_waypoints=8):
+    def _generate_smooth_waypoints(self, start_pos, end_pos, clearance_z, num_waypoints=8):
         """
         Generate smooth waypoints along a curved arc:
         up to clearance, then down to end.
@@ -381,15 +374,15 @@ class UR7e_CubeGrasp(Node):
         """Execute jobs from the queue sequentially."""
         if not self.job_queue:
             self.get_logger().info("All jobs completed for current cube.")
-            # Mark current cube as completed so we don't process it again
+
+            # Mark completed
             if self.current_cube_pose is not None:
                 px = self.current_cube_pose.point.x
                 py = self.current_cube_pose.point.y
                 pz = self.current_cube_pose.point.z
                 self.completed_cubes.append((px, py, pz))
                 self.get_logger().info(
-                    f"Marked {self.current_cube_color} cube at "
-                    f"({px:.3f}, {py:.3f}, {pz:.3f}) as completed."
+                    f"Marked {self.current_cube_color} cube at ({px:.3f}, {py:.3f}, {pz:.3f}) as completed."
                 )
                 self.current_cube_pose = None
                 self.current_cube_color = None
@@ -397,20 +390,13 @@ class UR7e_CubeGrasp(Node):
             self.processing_cube = False
 
             if self.cube_queue:
-                self.get_logger().info(
-                    f"{len(self.cube_queue)} cube(s) remaining in queue. "
-                    f"Processing next cube..."
-                )
+                self.get_logger().info(f"{len(self.cube_queue)} cube(s) remaining. Processing next cube...")
                 self._process_next_cube()
             else:
-                self.get_logger().info(
-                    "No more cubes in queue. Waiting for new detections..."
-                )
+                self.get_logger().info("No more cubes in queue. Waiting for new detections...")
             return
 
-        self.get_logger().info(
-            f"Executing job queue, {len(self.job_queue)} jobs remaining."
-        )
+        self.get_logger().info(f"Executing job queue, {len(self.job_queue)} jobs remaining.")
         next_job = self.job_queue.pop(0)
 
         if isinstance(next_job, tuple) and len(next_job) == 2 and next_job[0] == 'return_home':
@@ -423,12 +409,11 @@ class UR7e_CubeGrasp(Node):
 
             traj = self.ik_planner.plan_to_joints(home_joint_state)
             if traj is None:
-                self.get_logger().error(
-                    "Failed to plan to home position using MoveIt"
-                )
+                self.get_logger().error("Failed to plan to home position using MoveIt")
                 self.processing_cube = False
                 self.job_queue = []
                 return
+
             self.get_logger().info("MoveIt planned trajectory to home position")
             self._execute_joint_trajectory(traj.joint_trajectory)
 
@@ -445,6 +430,7 @@ class UR7e_CubeGrasp(Node):
                 self.processing_cube = False
                 self.job_queue = []
                 return
+
             self.get_logger().info("MoveIt planned trajectory")
             self._execute_joint_trajectory(traj.joint_trajectory)
 
@@ -462,7 +448,6 @@ class UR7e_CubeGrasp(Node):
     # --------------------------------------------------------------------------
 
     def _toggle_gripper(self):
-        """Toggle gripper open/closed asynchronously."""
         if not self.gripper_cli.wait_for_service(timeout_sec=5.0):
             self.get_logger().error('Gripper service not available')
             self.processing_cube = False
@@ -474,13 +459,10 @@ class UR7e_CubeGrasp(Node):
         future.add_done_callback(self._on_gripper_done)
 
     def _on_gripper_done(self, future):
-        """Callback once the gripper toggle service completes."""
         try:
             response = future.result()
             if not response.success:
-                self.get_logger().error(
-                    f'Gripper service failed: {response.message}'
-                )
+                self.get_logger().error(f'Gripper service failed: {response.message}')
                 self.processing_cube = False
                 self.job_queue = []
                 return
@@ -491,15 +473,13 @@ class UR7e_CubeGrasp(Node):
             self.job_queue = []
             return
 
-        # Proceed to next job after gripper is done
         self.execute_jobs()
 
     # --------------------------------------------------------------------------
-    # Trajectory execution via FollowJointTrajectory action
+    # Trajectory execution
     # --------------------------------------------------------------------------
 
     def _execute_joint_trajectory(self, joint_traj: JointTrajectory):
-        """Execute a joint trajectory."""
         self.get_logger().info('Waiting for controller action server...')
         self.exec_ac.wait_for_server()
 
@@ -511,7 +491,6 @@ class UR7e_CubeGrasp(Node):
         send_future.add_done_callback(self._on_goal_sent)
 
     def _on_goal_sent(self, future):
-        """Handle goal sent callback."""
         try:
             goal_handle = future.result()
             if not goal_handle.accepted:
@@ -529,11 +508,9 @@ class UR7e_CubeGrasp(Node):
             self.job_queue = []
 
     def _on_exec_done(self, future):
-        """Handle execution done callback."""
         try:
             _ = future.result().result
             self.get_logger().info('Execution complete.')
-            # Proceed to next job
             self.execute_jobs()
         except Exception as e:
             self.get_logger().error(f'Execution failed: {e}')
@@ -546,6 +523,7 @@ def main(args=None):
     node = UR7e_CubeGrasp()
     rclpy.spin(node)
     node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

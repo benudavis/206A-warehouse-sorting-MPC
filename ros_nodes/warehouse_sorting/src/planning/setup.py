@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             # Main executable (uses MPC for trajectory planning)
             'main_mpc = planning.main_mpc:main',
+            'main_mpc_new = planning.main_mpc_new:main',
             'main_waypoints = planning.main_waypoints:main',
             'tf = planning.static_tf_transform:main',
             'ik = planning.ik:main',

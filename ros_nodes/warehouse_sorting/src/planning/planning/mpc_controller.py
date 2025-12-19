@@ -1,547 +1,645 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+mpc_controller.py
 
-import numpy as np
+UR7e NMPC in joint space with:
+  - dynamics: q_{k+1} = q_k + dq_k
+  - cost: position tracking + (optional) orientation tracking + dq regularization
+  - constraints:
+      * joint limits (bounds)
+      * step limits (dq bounds)
+      * obstacle avoidance vs AABB: HARD constraint (NO SLACK)
+      * table safety: soft constraint (slack) by default (to avoid infeasibility)
+      * facing down: enforced ONLY AT TERMINAL (k = N) as a SOFT constraint (slack)
+
+Key user requirements implemented:
+  (1) Obstacle avoidance is a constraint that should never be violated -> HARD inequality d(point,aabb) >= radius.
+  (2) Facing down only required at desired location -> constraints only at k=N (terminal), not along horizon.
+
+Returns:
+  dq0, q_next, q_traj, dq_traj,
+  s_face (terminal slack scalar), s_tab,
+  success, solver_status, ipopt_stats
+"""
+
 import casadi as ca
+import numpy as np
 
 
-# ----------------------------------------------------------------------
-# Analytic FK: q (6,) -> EE position (3,) in UR7e base_link frame
-# Uses Product of Exponentials (POE) method matching forward_kinematics.py
-# ----------------------------------------------------------------------
-def build_ur7e_fk_function():
-    """
-    Build a CasADi function fk(q) -> p_ee (3,) in UR7e base_link frame.
-    Uses Product of Exponentials method with parameters from forward_kinematics.py.
-
-    Conventions:
-        - q is a 6-element vector [q1..q6] in radians.
-          (shoulder pan, shoulder lift, elbow, wrist1, wrist2, wrist3)
-        - EE position is at wrist_3_link origin (tool frame).
-        - Output is in UR7e base frame (for ROS: base_link).
-    """
-    # Joint vector
-    q = ca.SX.sym("q", 6)
-
-    # ------------------------------------------------------------------
-    # UR7e kinematic parameters (matching forward_kinematics.py)
-    # ------------------------------------------------------------------
-    # Points on each joint axis in the zero config
-    q0 = ca.SX(3, 6)
-    q0[:, 0] = ca.SX([0.,     0.,      0.1625])   # shoulder pan
-    q0[:, 1] = ca.SX([0.,     0.,      0.1625])   # shoulder lift
-    q0[:, 2] = ca.SX([0.425,  0.,      0.1625])   # elbow
-    q0[:, 3] = ca.SX([0.817,  0.1333,  0.1625])   # wrist 1
-    q0[:, 4] = ca.SX([0.817,  0.1333,  0.06285])  # wrist 2
-    q0[:, 5] = ca.SX([0.817,  0.233,   0.06285])  # wrist 3 (tool frame origin)
-
-    # Axis vectors of each joint axis in the zero config
-    w0 = ca.SX(3, 6)
-    w0[:, 0] = ca.SX([0.,  0.,  1.])    # shoulder pan
-    w0[:, 1] = ca.SX([0.,  1.,  0.])    # shoulder lift
-    w0[:, 2] = ca.SX([0.,  1.,  0.])    # elbow
-    w0[:, 3] = ca.SX([0.,  1.,  0.])    # wrist 1
-    w0[:, 4] = ca.SX([0.,  0., -1.])    # wrist 2 
-    w0[:, 5] = ca.SX([0.,  1.,  0.])    # wrist 3
-
-    # Rotation matrix from base_link to wrist_3_link in zero config
-    R_zero = ca.SX(3, 3)
-    R_zero[0, :] = ca.SX([-1.,  0.,  0.])
-    R_zero[1, :] = ca.SX([ 0.,  0.,  1.])
-    R_zero[2, :] = ca.SX([ 0.,  1.,  0.])
-
-    # Build twists ξ_i = [v_i; ω_i] with v_i = -ω_i × q_i
-    xi = ca.SX(6, 6)
-    for i in range(6):
-        omega = w0[:, i]
-        q_point = q0[:, i]
-        # v = -omega × q (cross product: a × b = [a_y*b_z - a_z*b_y, a_z*b_x - a_x*b_z, a_x*b_y - a_y*b_x])
-        omega_neg = -omega
-        v = ca.vertcat(
-            omega_neg[1] * q_point[2] - omega_neg[2] * q_point[1],
-            omega_neg[2] * q_point[0] - omega_neg[0] * q_point[2],
-            omega_neg[0] * q_point[1] - omega_neg[1] * q_point[0]
-        )
-        xi[0:3, i] = v
-        xi[3:6, i] = omega
-
-    # Zero-configuration transform gst(0)
-    gst0 = ca.SX.eye(4)
-    gst0[0:3, 0:3] = R_zero
-    gst0[0:3, 3] = q0[:, 5]  # wrist_3_link origin
-
-    # ------------------------------------------------------------------
-    # Helper: Compute exp(ξ_hat * theta) for a single twist
-    # ------------------------------------------------------------------
-    def exp_twist(xi_vec: ca.SX, theta: ca.SX) -> ca.SX:
-        """
-        Compute exp(ξ_hat * theta) using product of exponentials formula.
-        Returns 4x4 homogeneous transformation matrix.
-        All joints are revolute, so omega_norm = 1.
-        """
-        v = xi_vec[0:3]
-        omega = xi_vec[3:6]
-        
-        # Skew-symmetric matrix for omega
-        omega_hat = ca.SX(3, 3)
-        omega_hat[0, 0] = 0
-        omega_hat[0, 1] = -omega[2]
-        omega_hat[0, 2] = omega[1]
-        omega_hat[1, 0] = omega[2]
-        omega_hat[1, 1] = 0
-        omega_hat[1, 2] = -omega[0]
-        omega_hat[2, 0] = -omega[1]
-        omega_hat[2, 1] = omega[0]
-        omega_hat[2, 2] = 0
-
-        # For revolute joints, omega is unit vector, so omega_norm = 1
-        # Rotation matrix using Rodrigues' formula: R = I + sin(θ)*ω_hat + (1-cos(θ))*ω_hat^2
-        I3 = ca.SX_eye(3)
-        R = I3 + ca.sin(theta) * omega_hat + (1 - ca.cos(theta)) * (omega_hat @ omega_hat)
-
-        # Translation vector: p = V * v where V = I*θ + (1-cos(θ))*ω_hat + (θ-sin(θ))*ω_hat^2
-        V = I3 * theta + (1 - ca.cos(theta)) * omega_hat + (theta - ca.sin(theta)) * (omega_hat @ omega_hat)
-        p = V @ v
-        
-        # Build 4x4 homogeneous transformation
-        g = ca.SX.eye(4)
-        g[0:3, 0:3] = R
-        g[0:3, 3] = p
-        
-        return g
-
-    # ------------------------------------------------------------------
-    # Product of exponentials: g(θ) = exp(ξ_1*θ_1) ... exp(ξ_6*θ_6) * g(0)
-    # ------------------------------------------------------------------
-    g_theta = ca.SX.eye(4)
-    for i in range(6):
-        g_theta = g_theta @ exp_twist(xi[:, i], q[i])
-    
-    # Multiply by zero-configuration transform
-    g_theta = g_theta @ gst0
-
-    # Extract position (wrist_3_link origin)
-    p_ee = g_theta[0:3, 3]
-
-    fk_fun = ca.Function("fk_ur7e_base", [q], [p_ee])
-    return fk_fun
+def quat_to_rotmat_xyzw(qx, qy, qz, qw):
+    """Quaternion (x,y,z,w) -> 3x3 rotation matrix (numpy)."""
+    x, y, z, w = float(qx), float(qy), float(qz), float(qw)
+    n = x*x + y*y + z*z + w*w
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+    xx, yy, zz = x*x*s, y*y*s, z*z*s
+    xy, xz, yz = x*y*s, x*z*s, y*z*s
+    wx, wy, wz = w*x*s, w*y*s, w*z*s
+    return np.array([
+        [1.0 - (yy + zz),       xy - wz,       xz + wy],
+        [      xy + wz, 1.0 - (xx + zz),       yz - wx],
+        [      xz - wy,       yz + wx, 1.0 - (xx + yy)],
+    ], dtype=float)
 
 
-# ----------------------------------------------------------------------
-# MPC controller with EE obstacle avoidance using analytic FK
-# ----------------------------------------------------------------------
 class MPCController:
-    """
-    MPC controller for a position-controlled arm with mandatory end-effector collision avoidance.
-    
-    Uses analytic forward kinematics (Product of Exponentials) to compute end-effector positions
-    and enforce collision avoidance constraints. FK is always enabled and required.
-    """
-
     def __init__(
         self,
-        n_joints: int = 6,
-        horizon: int = 6,  # Reduced default for faster computation
-        dt: float = 0.15,  # Increased default for faster execution
+        N=20,
+        dt=0.1,
+        q_min=None,
+        q_max=None,
+        dq_min=None,
+        dq_max=None,
+        cube_side=0.05,
+        safety_margin=0.01,
+        sphere_offsets_ee=None,
+        sphere_radii=None,
+        use_lowest_sphere_for_table=True,
+        table_margin=0.005,
+        # weights
+        w_pos=50.0,
+        w_rot=0.0,                # NOTE: keep 0 unless you truly want orientation tracking along path
+        w_dq=0.5,
+        w_terminal_mult=10.0,
+        # terminal facing constraint (soft) knobs
+        facing_tilt_deg=8.0,
+        w_face_slack=5e4,
+        # table soft constraint weight
+        w_table_slack=5e4,
+        # tool transform: wrist_3_link -> tool0
+        R_wrist3_tool0=None,
+        p_wrist3_tool0=None,
+        tool_q_xyzw=None,
+        tool_p=None,
+        solver_opts=None,
     ):
-        self.n_joints = n_joints
-        self.horizon = horizon
-        self.dt = dt
+        self.N = int(N)
+        self.dt = float(dt)
 
-        # Cost weights (joint-space tracking + smoothness + velocity)
-        self.Q = np.eye(n_joints) * 500.0
-        self.R = np.eye(n_joints) * 0.05  # Reduced smoothness penalty for faster motion
-        self.Q_terminal = np.eye(n_joints) * 10000.0 # 1000.0
-        self.Q_v = np.eye(n_joints) * 0.01  # Velocity cost weight - much reduced to allow fast motions
+        # Joint limits
+        if q_min is None:
+            q_min = np.array([-2*np.pi]*6, dtype=float)
+        if q_max is None:
+            q_max = np.array([ 2*np.pi]*6, dtype=float)
 
-        # Obstacle avoidance (soft margin)
-        self.obstacle_weight = 1e2
+        # Step limits
+        if dq_min is None:
+            dq_min = np.array([-0.15]*6, dtype=float)
+        if dq_max is None:
+            dq_max = np.array([ 0.15]*6, dtype=float)
 
-        # Joint & velocity constraints
-        self.joint_limits = (
-            np.array([-2 * np.pi] * n_joints),
-            np.array([+2 * np.pi] * n_joints),
-        )
-        self.max_velocity = 0.5  # [rad/s] - increased for much faster motion
+        self.q_min = np.asarray(q_min, dtype=float).reshape(6,)
+        self.q_max = np.asarray(q_max, dtype=float).reshape(6,)
+        self.dq_min = np.asarray(dq_min, dtype=float).reshape(6,)
+        self.dq_max = np.asarray(dq_max, dtype=float).reshape(6,)
 
-        # Obstacles: list of (center[3], half_size[3]) in base_link frame
-        self.obstacles = []
-        self.n_max_obstacles = 10
-        self.safety_margin = 0.0  # [m] - Set to 0 to allow reaching target
+        self.cube_side = float(cube_side)
+        self.safety_margin = float(safety_margin)
+        self.use_lowest_sphere_for_table = bool(use_lowest_sphere_for_table)
+        self.table_margin = float(table_margin)
 
-        # Minimum z constraint (for table avoidance after picking)
-        self.minimum_z = None  # [m] - None means disabled, otherwise enforces ee_z >= minimum_z
+        # weights
+        self.w_pos = float(w_pos)
+        self.w_rot = float(w_rot)
+        self.w_dq = float(w_dq)
+        self.w_terminal_mult = float(w_terminal_mult)
 
-        # Analytic FK - always required for EE collision avoidance
-        try:
-            self.fk_fun = build_ur7e_fk_function()
-            print("✓ Using analytic UR7e FK (Product of Exponentials, base_link frame) for EE collision avoidance.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to build analytic UR7e FK: {e}. FK is required for MPC EE collision avoidance.")
+        # terminal facing params
+        self.facing_tilt_deg = float(facing_tilt_deg)
+        self.w_face_slack = float(w_face_slack)
 
-        self.solver = None
-        self.prev_solution = None
-        self._setup_optimization()
+        # table soft params
+        self.w_table_slack = float(w_table_slack)
 
-    # ------------------------------------------------------------------
-    # Public configuration helpers
-    # ------------------------------------------------------------------
-    def set_cost_weights(self, Q_scalar, Q_terminal_scalar, R_scalar):
-        self.Q = np.eye(self.n_joints) * Q_scalar
-        self.Q_terminal = np.eye(self.n_joints) * Q_terminal_scalar
-        self.R = np.eye(self.n_joints) * R_scalar
-        self.prev_solution = None
-        self._setup_optimization()
+        # Proxy spheres offsets/radii
+        if sphere_offsets_ee is None:
+            sphere_offsets_ee = [
+                np.array([0.0, 0.0, 0.00]),
+                np.array([0.0, 0.0, 0.02]),
+                np.array([0.0, 0.0, 0.03]),
+            ]
 
-    def set_joint_limits(self, lower, upper):
-        self.joint_limits = (np.array(lower), np.array(upper))
-        self.prev_solution = None
-        self._setup_optimization()
+        r_cube = 0.5*np.sqrt(3.0)*self.cube_side
+        if sphere_radii is None:
+            sphere_radii = [
+                0.035,
+                0.030,
+                r_cube,
+            ]
 
-    def set_velocity_limit(self, max_vel):
-        self.max_velocity = float(max_vel)
-        self.prev_solution = None
-        self._setup_optimization()
-    
-    def set_safety_margin(self, margin):
-        """
-        Set safety margin for obstacle avoidance (soft penalty zone).
-        Larger values encourage staying further from obstacles.
-        
-        Args:
-            margin: Safety margin [m]. 0.0 = no soft penalty (only hard constraint).
-                   Typical values: 0.05-0.15m for going over obstacles.
-        """
-        self.safety_margin = float(margin)
-        self.prev_solution = None
-        self._setup_optimization()
-        print(f"Set safety margin: {margin:.3f} m")
-    
-    def set_obstacle_weight(self, weight):
-        """
-        Set obstacle avoidance cost weight.
-        Higher values make obstacle avoidance more important relative to target tracking.
-        
-        Args:
-            weight: Obstacle cost weight. Default is 1e4. Higher = more avoidance.
-        """
-        self.obstacle_weight = float(weight)
-        self.prev_solution = None
-        self._setup_optimization()
-        print(f"Set obstacle weight: {weight:.2e}")
+        assert len(sphere_offsets_ee) == len(sphere_radii), "Offsets and radii length mismatch."
+        self.sphere_offsets_ee = [np.asarray(o, dtype=float).reshape(3,) for o in sphere_offsets_ee]
+        self.sphere_radii = [float(r) + self.safety_margin for r in sphere_radii]  # inflate
 
-    def add_obstacle(self, position, size):
-        """
-        Add an obstacle for avoidance.
-
-        Args:
-            position: (3,) center [x, y, z] in base_link.
-            size: (3,) half-extents [sx, sy, sz] (axis-aligned box).
-        """
-        self.obstacles.append((np.array(position, dtype=float),
-                               np.array(size, dtype=float)))
-        print(f"Added obstacle at {position} with size {size}")
-
-    def clear_obstacles(self):
-        self.obstacles = []
-        print("Cleared all obstacles from MPC")
-    
-    def set_minimum_z(self, z_min):
-        """
-        Set minimum z constraint for end-effector (hard constraint).
-        Prevents end-effector from going below this height.
-        
-        Args:
-            z_min: Minimum z coordinate [m] in base_link frame. None to disable.
-        """
-        self.minimum_z = float(z_min) if z_min is not None else None
-        self.prev_solution = None
-        self._setup_optimization()
-        if z_min is not None:
-            print(f"Set minimum z constraint: {z_min:.3f} m")
+        # Tool transform (wrist3 -> tool0)
+        if R_wrist3_tool0 is not None:
+            R_tool = np.asarray(R_wrist3_tool0, dtype=float).reshape(3, 3)
+        elif tool_q_xyzw is not None:
+            qx, qy, qz, qw = tool_q_xyzw
+            R_tool = quat_to_rotmat_xyzw(qx, qy, qz, qw)
         else:
-            print("Cleared minimum z constraint")
-    
-    def clear_minimum_z(self):
-        """Clear minimum z constraint (disable it)."""
-        self.minimum_z = None
-        self.prev_solution = None
-        self._setup_optimization()
-        print("Cleared minimum z constraint")
+            R_tool = np.eye(3)
 
-    # ------------------------------------------------------------------
-    # Optimization problem
-    # ------------------------------------------------------------------
-    def _setup_optimization(self):
-        n = self.n_joints
-        H = self.horizon
+        if p_wrist3_tool0 is not None:
+            p_tool = np.asarray(p_wrist3_tool0, dtype=float).reshape(3,)
+        elif tool_p is not None:
+            p_tool = np.asarray(tool_p, dtype=float).reshape(3,)
+        else:
+            p_tool = np.zeros(3)
 
-        q = ca.SX.sym("q", n, H + 1)
-        q_current = ca.SX.sym("q_current", n)
-        dq_current = ca.SX.sym("dq_current", n)  # Current velocity
-        q_target = ca.SX.sym("q_target", n)
+        self.R_wrist3_tool0 = R_tool
+        self.p_wrist3_tool0 = p_tool
 
-        obs_pos = ca.SX.sym("obs_pos", 3, self.n_max_obstacles)
-        obs_size = ca.SX.sym("obs_size", 3, self.n_max_obstacles)
-        n_active_obs = ca.SX.sym("n_active_obs", 1)
+        # facing tolerances
+        tilt = np.deg2rad(self.facing_tilt_deg)
+        self.facing_cos_tol = float(np.cos(tilt))
+        self.facing_sin_tol = float(np.sin(tilt))
 
-        cost = 0
+        # Build FK + distance and solver
+        self.fk_T, self.fk_p, self.fk_R = self._build_ur7e_fk_functions_tool0()
+        self.dist_point_aabb = self._build_point_aabb_distance_function()
+        self._build_solver(solver_opts=solver_opts or {})
 
-        # Running cost
-        for k in range(H):
-            # Position tracking cost
-            q_error = q[:, k] - q_target
-            cost += ca.mtimes([q_error.T, self.Q, q_error])
+        self._last_dq_sol = None
 
-            # Position change cost (smoothness)
-            if k > 0:
-                q_change = q[:, k] - q[:, k - 1]
-                # cost += ca.mtimes([q_change.T, self.R, q_change])
-            
-            # Velocity cost (penalize high velocities for smoothness)
-            velocity_k = (q[:, k + 1] - q[:, k]) / self.dt
-            cost += ca.mtimes([velocity_k.T, self.Q_v, velocity_k])
+    # -----------------------------
+    # Public API
+    # -----------------------------
+    def solve(self, q0, p_goal, R_goal, aabb_bounds, pickup_height=None):
+        """
+        Solve NMPC.
 
-        # Terminal cost
-        q_error_final = q[:, H] - q_target
-        cost += ca.mtimes([q_error_final.T, self.Q_terminal, q_error_final])
+        Returns dict:
+          dq0, q_next, q_traj, dq_traj,
+          s_face (terminal slack scalar),
+          s_tab,
+          success, solver_status, ipopt_stats
+        """
+        q0 = np.asarray(q0, dtype=float).reshape(6,)
+        p_goal = np.asarray(p_goal, dtype=float).reshape(3,)
+        R_goal = np.asarray(R_goal, dtype=float).reshape(3, 3)
+        aabb_bounds = np.asarray(aabb_bounds, dtype=float).reshape(6,)
 
-        # Constraints
-        constraints = []
-        lbg = []
-        ubg = []
+        if pickup_height is None:
+            pickup_height = float(np.array(self.fk_p(ca.DM(q0))).reshape(3,)[2])
 
-        # Initial condition: position
-        constraints.append(q[:, 0] - q_current)
-        lbg.extend([0.0] * n)
-        ubg.extend([0.0] * n)
-        
-        # Initial velocity constraint (soft - allows some deviation for smoother transitions)
-        # This encourages the first step to match current velocity but allows flexibility
-        velocity_0 = (q[:, 1] - q[:, 0]) / self.dt
-        velocity_error = velocity_0 - dq_current
-        # Add as soft cost instead of hard constraint for more flexibility
-        # cost += 0.1 * ca.sumsqr(velocity_error)  # Small weight to encourage matching current velocity
+        p = self._pack_params(q0, p_goal, R_goal, aabb_bounds, float(pickup_height))
+        x0 = self._initial_guess(q0)
 
-        # Velocity constraints
-        for k in range(H):
-            velocity = (q[:, k + 1] - q[:, k]) / self.dt
-            for j in range(n):
-                constraints.append(velocity[j])
-                lbg.append(-self.max_velocity)
-                ubg.append(+self.max_velocity)
+        sol = None
+        status = "unknown"
+        stats = {}
+        try:
+            sol = self.solver(x0=x0, lbx=self.lbx, ubx=self.ubx,
+                              lbg=self.lbg, ubg=self.ubg, p=p)
+            stats = dict(self.solver.stats())
+            status = str(stats.get("return_status", "unknown"))
+        except Exception as e:
+            return {
+                "dq0": np.zeros(6),
+                "q_next": q0.copy(),
+                "q_traj": np.tile(q0, (self.N+1, 1)),
+                "dq_traj": np.zeros((self.N, 6)),
+                "s_face": 0.0,
+                "s_tab": np.zeros((self.N, len(self.sphere_offsets_ee))) if self.use_lowest_sphere_for_table else np.zeros((self.N,)),
+                "success": False,
+                "solver_status": f"solve_failed: {e}",
+                "ipopt_stats": {"exception": str(e)},
+            }
 
-        # Obstacle constraints - always use FK for EE collision avoidance
-        for k in range(H + 1):
-            ee_pos_k = self.fk_fun(q[:, k])  # (3,) in base_link
+        ok_statuses = {"Solve_Succeeded", "Solved_To_Acceptable_Level"}
+        if sol is None or status not in ok_statuses:
+            return {
+                "dq0": np.zeros(6),
+                "q_next": q0.copy(),
+                "q_traj": np.tile(q0, (self.N+1, 1)),
+                "dq_traj": np.zeros((self.N, 6)),
+                "s_face": 0.0,
+                "s_tab": np.zeros((self.N, len(self.sphere_offsets_ee))) if self.use_lowest_sphere_for_table else np.zeros((self.N,)),
+                "success": False,
+                "solver_status": status,
+                "ipopt_stats": stats,
+            }
 
-            for i_obs in range(self.n_max_obstacles):
-                center = obs_pos[:, i_obs]
-                half_size = obs_size[:, i_obs]
-                diff = ee_pos_k - center
+        x_opt = np.array(sol["x"]).reshape(-1)
+        q_traj, dq_traj, s_face_term, s_tab = self._unpack_decision_full(x_opt)
+        self._last_dq_sol = dq_traj.copy()
 
-                # Hard constraint: EE must not be inside obstacle
-                inside_clearances = half_size - ca.fabs(diff)
-                min_inside = inside_clearances[0]
-                min_inside = ca.fmin(min_inside, inside_clearances[1])
-                min_inside = ca.fmin(min_inside, inside_clearances[2])
+        dq0 = dq_traj[0].copy()
+        q_next = q0 + dq0
 
-                active_mask = ca.if_else(i_obs < n_active_obs, 1.0, 0.0)
-                g_obs = active_mask * min_inside
-                constraints.append(g_obs)
-                lbg.append(-1e3)
-                ubg.append(0.0)  # must not be strictly inside
-
-                # Hard constraint: EE must not be inside safety margin zone (if safety_margin > 0)
-                if self.safety_margin > 0:
-                    inflated = half_size + self.safety_margin
-                    inside_safety_clearances = inflated - ca.fabs(diff)
-                    min_inside_safety = inside_safety_clearances[0]
-                    min_inside_safety = ca.fmin(min_inside_safety, inside_safety_clearances[1])
-                    min_inside_safety = ca.fmin(min_inside_safety, inside_safety_clearances[2])
-                    
-                    g_safety = active_mask * min_inside_safety
-                    constraints.append(g_safety)
-                    lbg.append(-1e3)
-                    ubg.append(0.0)  # must not be inside safety margin zone
-                    
-                    # Additional constraint: If EE is near obstacle in XY, it MUST be above obstacle top
-                    # This prevents going through the obstacle at low z
-                    # Use a more aggressive approach: if within extended XY region, enforce minimum z
-                    diff_xy = diff[:2]  # X and Y components
-                    
-                    # Extend obstacle XY region significantly to catch all points that could intersect
-                    # Use obstacle size + 4x safety margin to ensure we catch all edge cases
-                    extended_xy = half_size[:2] + 4.0 * self.safety_margin
-                    
-                    # Check if point is within extended XY region
-                    inside_xy_x = extended_xy[0] - ca.fabs(diff_xy[0])  # Positive if inside extended X bounds
-                    inside_xy_y = extended_xy[1] - ca.fabs(diff_xy[1])  # Positive if inside extended Y bounds
-                    
-                    # Point is within extended XY if BOTH X and Y are inside
-                    # Use smooth approximation: if both inside_xy_x > 0 AND inside_xy_y > 0, then must be above
-                    xy_proximity = ca.fmax(0.0, inside_xy_x) * ca.fmax(0.0, inside_xy_y)
-                    
-                    # Obstacle top (with safety margin for clearance)
-                    obstacle_top = center[2] + half_size[2] + self.safety_margin
-                    ee_z = ee_pos_k[2]
-                    
-                    # Constraint: if within extended XY region (xy_proximity > small_threshold), 
-                    # then ee_z must be >= obstacle_top
-                    # Use a smoother formulation: when xy_proximity is significant, enforce height
-                    # We use: (obstacle_top - ee_z) * smooth_indicator <= 0
-                    # where smooth_indicator = 1 when xy_proximity > threshold, 0 otherwise
-                    threshold = 0.001  # Small threshold to avoid numerical issues
-                    smooth_indicator = ca.fmax(0.0, (xy_proximity - threshold) / (1.0 + threshold))  # Smooth step from 0 to 1
-                    
-                    # Constraint: smooth_indicator * (obstacle_top - ee_z) <= 0
-                    # This means: if smooth_indicator > 0 (near obstacle in XY), then ee_z >= obstacle_top
-                    g_over_obstacle = active_mask * smooth_indicator * (obstacle_top - ee_z)
-                    constraints.append(g_over_obstacle)
-                    lbg.append(-1e3)
-                    ubg.append(0.0)  # If near obstacle in XY, must be above obstacle top
-                    
-                    # When safety_margin is a hard constraint, we disable the soft penalty
-                    # to avoid double-penalizing and allow the MPC to reach targets that satisfy constraints
-                    # (Soft cost is only used when safety_margin = 0 for soft avoidance behavior)
-                else:
-                    # Soft cost: only used when safety_margin = 0 (soft avoidance, no hard constraint)
-                    # When safety_margin > 0, we rely on the hard constraint only
-                    u_margin = ca.fabs(diff) - half_size
-                    pen_vec = ca.fmin(0, u_margin)
-                    pen_mag = ca.sqrt(ca.sumsqr(pen_vec))
-                    cost += active_mask * self.obstacle_weight * pen_mag ** 2
-            
-            # Minimum z constraint (hard constraint: prevent going below table after picking)
-            if self.minimum_z is not None:
-                ee_z = ee_pos_k[2]  # z-coordinate of end-effector
-                constraints.append(ee_z)
-                lbg.append(self.minimum_z)  # ee_z >= minimum_z
-                ubg.append(1e3)  # No upper bound
-
-        # Variable bounds (joint limits)
-        lbx = []
-        ubx = []
-        for _ in range(H + 1):
-            lbx.extend(self.joint_limits[0])
-            ubx.extend(self.joint_limits[1])
-
-        opt_variables = ca.reshape(q, -1, 1)
-        opt_params = ca.vertcat(
-            q_current,
-            dq_current,
-            q_target,
-            ca.reshape(obs_pos, -1, 1),
-            ca.reshape(obs_size, -1, 1),
-            n_active_obs,
-        )
-
-        nlp = {
-            "x": opt_variables,
-            "p": opt_params,
-            "f": cost,
-            "g": ca.vertcat(*constraints) if constraints else ca.SX.zeros(0, 1),
+        return {
+            "dq0": dq0,
+            "q_next": q_next,
+            "q_traj": q_traj,
+            "dq_traj": dq_traj,
+            "s_face": float(s_face_term),
+            "s_tab": s_tab,
+            "success": True,
+            "solver_status": status,
+            "ipopt_stats": stats,
         }
 
-        opts = {
-            "ipopt.print_level": 0,
-            "ipopt.max_iter": 15,  # Reduced from 30 for faster solves
-            "print_time": 0,
-            "ipopt.tol": 1e-2,  # Relaxed from 5e-3 for faster convergence
-            "ipopt.acceptable_tol": 2e-2,  # Relaxed from 1e-2
-            "ipopt.warm_start_init_point": "yes",
-            "ipopt.mu_strategy": "adaptive",
-            "ipopt.acceptable_iter": 1,  # Accept solution after just 1 acceptable iteration
-            "ipopt.fast_step_computation": "yes",  # Enable fast step computation
-        }
+    # -----------------------------
+    # Solver construction
+    # -----------------------------
+    def _build_solver(self, solver_opts):
+        N = self.N
+        M = len(self.sphere_offsets_ee)
 
-        self.solver = ca.nlpsol("solver", "ipopt", nlp, opts)
+        # Parameters
+        q0_p = ca.SX.sym("q0", 6)
+        p_goal = ca.SX.sym("p_goal", 3)
+        R_goal = ca.SX.sym("R_goal", 3, 3)
+        aabb = ca.SX.sym("aabb", 6)      # [xmin,xmax,ymin,ymax,zmin,zmax]
+        h_pick = ca.SX.sym("h_pick", 1)  # table reference height
+        P = ca.vertcat(q0_p, p_goal, ca.reshape(R_goal, 9, 1), aabb, h_pick)
+
+        # Decision vars
+        q_vars = ca.SX.sym("q_traj", 6*(N+1))
+        dq_vars = ca.SX.sym("dq_traj", 6*N)
+
+        # Terminal facing slack (>= 0)
+        s_face_term = ca.SX.sym("s_face_term", 1)
+
+        # Table slack(s) (>= 0)
+        if self.use_lowest_sphere_for_table:
+            s_tab = ca.SX.sym("s_tab", N*M)
+        else:
+            s_tab = ca.SX.sym("s_tab", N)
+
+        X = ca.vertcat(q_vars, dq_vars, s_face_term, s_tab)
+
+        def qk(k): return q_vars[6*k:6*(k+1)]
+        def dqk(k): return dq_vars[6*k:6*(k+1)]
+        def stab(k, i=None):
+            if self.use_lowest_sphere_for_table:
+                return s_tab[k*M + int(i)]
+            return s_tab[k]
+
+        # Bounds on decision vars
+        lbx, ubx = [], []
+
+        for _ in range(N+1):
+            lbx.extend(self.q_min.tolist()); ubx.extend(self.q_max.tolist())
+        for _ in range(N):
+            lbx.extend(self.dq_min.tolist()); ubx.extend(self.dq_max.tolist())
+
+        # s_face_term >= 0
+        lbx.append(0.0); ubx.append(1e6)
+
+        # s_tab >= 0
+        if self.use_lowest_sphere_for_table:
+            lbx.extend([0.0]*(N*M)); ubx.extend([1e6]*(N*M))
+        else:
+            lbx.extend([0.0]*N); ubx.extend([1e6]*N)
+
         self.lbx = np.array(lbx, dtype=float)
         self.ubx = np.array(ubx, dtype=float)
+
+        # Cost weights
+        Qp = self.w_pos * ca.SX.eye(3)
+        Qr = self.w_rot * ca.SX.eye(3)
+        Rw = self.w_dq * ca.SX.eye(6)
+        QpN = self.w_terminal_mult * Qp
+        QrN = self.w_terminal_mult * Qr
+
+        cos_tol = self.facing_cos_tol
+        sin_tol = self.facing_sin_tol
+
+        g = []
+        lbg = []
+        ubg = []
+        J = 0
+
+        # q0 equality
+        g.append(qk(0) - q0_p)
+        lbg += [0.0]*6
+        ubg += [0.0]*6
+
+        for k in range(N):
+            q_k = qk(k)
+            dq_k = dqk(k)
+            q_kp1 = qk(k+1)
+
+            # dynamics
+            g.append(q_kp1 - (q_k + dq_k))
+            lbg += [0.0]*6
+            ubg += [0.0]*6
+
+            # pose costs (position always; rotation only if w_rot > 0)
+            p_k = self.fk_p(q_k)
+            e_p = p_k - p_goal
+            J += ca.mtimes([e_p.T, Qp, e_p])
+            if self.w_rot > 0.0:
+                R_k = self.fk_R(q_k)
+                e_R = self._orientation_error_log(R_k, R_goal)
+                J += ca.mtimes([e_R.T, Qr, e_R])
+
+            # control regularization
+            J += ca.mtimes([dq_k.T, Rw, dq_k])
+
+            # -----------------------------
+            # HARD obstacle avoidance (NO SLACK)
+            # For each proxy sphere center: dist(center, aabb) >= radius
+            # -----------------------------
+            centers = self._sphere_centers_from_q(q_k)  # stacked length 3*M
+            for i in range(M):
+                c_i = centers[3*i:3*(i+1)]
+                d_i = self.dist_point_aabb(c_i, aabb)
+                g.append(d_i)
+                lbg.append(self.sphere_radii[i])
+                ubg.append(1e19)
+
+                # Table safety: soft (keep slack so IPOPT doesn't die on occasional infeas)
+                if self.use_lowest_sphere_for_table:
+                    st = stab(k, i)
+                    threshold = h_pick + self.table_margin + self.sphere_radii[i]
+                    g.append((c_i[2] + st) - threshold)
+                    lbg.append(0.0)
+                    ubg.append(1e19)
+                    J += self.w_table_slack * (st*st)
+
+            if not self.use_lowest_sphere_for_table:
+                st = stab(k)
+                threshold = h_pick + self.table_margin
+                g.append((p_k[2] + st) - threshold)
+                lbg.append(0.0)
+                ubg.append(1e19)
+                J += self.w_table_slack * (st*st)
+
+        # -----------------------------
+        # Terminal cost + terminal-only facing constraint
+        # -----------------------------
+        q_N = qk(N)
+        p_N = self.fk_p(q_N)
+        e_pN = p_N - p_goal
+        J += ca.mtimes([e_pN.T, QpN, e_pN])
+
+        if self.w_rot > 0.0:
+            R_N = self.fk_R(q_N)
+            e_RN = self._orientation_error_log(R_N, R_goal)
+            J += ca.mtimes([e_RN.T, QrN, e_RN])
+
+        # terminal-only facing-down (soft)
+        R_N = self.fk_R(q_N)
+        z_ee_N = R_N[:, 2]
+        sfN = s_face_term[0]
+
+        # -z_ee[2] + sfN >= cos_tol
+        g.append(-z_ee_N[2] + sfN)
+        lbg.append(cos_tol)
+        ubg.append(1e19)
+
+        # norm([zx,zy]) <= sin_tol + sfN  => norm - (sin_tol+sfN) <= 0
+        g.append(ca.norm_2(z_ee_N[0:2]) - (sin_tol + sfN))
+        lbg.append(-1e19)
+        ubg.append(0.0)
+
+        J += self.w_face_slack * (sfN*sfN)
+
+        nlp = {"x": X, "f": J, "g": ca.vertcat(*g), "p": P}
+
+        default_opts = {
+            "ipopt.print_level": 0,
+            "ipopt.sb": "yes",
+            "print_time": 0,
+            "ipopt.max_iter": 250,
+            "ipopt.tol": 5e-4,
+        }
+        default_opts.update(solver_opts)
+
+        self.solver = ca.nlpsol("mpc_solver", "ipopt", nlp, default_opts)
         self.lbg = np.array(lbg, dtype=float)
         self.ubg = np.array(ubg, dtype=float)
-        self.prev_solution = None
 
-        print(
-            f"✓ MPC initialized: {self.n_joints} joints, horizon={self.horizon}, dt={self.dt}"
+        # Cache sizes for unpacking
+        self._nx_q = 6*(N+1)
+        self._nx_dq = 6*N
+        self._nx_face = 1
+        self._nx_tab = (N * M) if self.use_lowest_sphere_for_table else N
+
+    # -----------------------------
+    # Packing / Unpacking
+    # -----------------------------
+    def _pack_params(self, q0, p_goal, R_goal, aabb_bounds, pickup_height):
+        return np.concatenate([
+            np.asarray(q0).reshape(6,),
+            np.asarray(p_goal).reshape(3,),
+            np.asarray(R_goal).reshape(9,),
+            np.asarray(aabb_bounds).reshape(6,),
+            np.asarray([pickup_height]).reshape(1,)
+        ]).astype(float)
+
+    def _initial_guess(self, q0):
+        N = self.N
+        M = len(self.sphere_offsets_ee)
+        q0 = np.asarray(q0, dtype=float).reshape(6,)
+
+        if self._last_dq_sol is None:
+            dq_guess = np.zeros((N, 6))
+        else:
+            dq_guess = np.vstack([self._last_dq_sol[1:], self._last_dq_sol[-1:]])
+
+        q_guess = np.zeros((N+1, 6))
+        q_guess[0] = q0
+        for k in range(N):
+            q_guess[k+1] = q_guess[k] + dq_guess[k]
+
+        s_face_term_guess = np.array([0.0], dtype=float)
+
+        if self.use_lowest_sphere_for_table:
+            s_tab_guess = np.zeros((N*M,), dtype=float)
+        else:
+            s_tab_guess = np.zeros((N,), dtype=float)
+
+        return np.concatenate([
+            q_guess.reshape(-1),
+            dq_guess.reshape(-1),
+            s_face_term_guess.reshape(-1),
+            s_tab_guess.reshape(-1),
+        ]).astype(float)
+
+    def _unpack_decision_full(self, x):
+        """
+        Returns:
+          q_traj: (N+1,6)
+          dq_traj:(N,6)
+          s_face_term: scalar
+          s_tab:  (N,M) if use_lowest_sphere_for_table else (N,)
+        """
+        N = self.N
+        M = len(self.sphere_offsets_ee)
+
+        i0 = 0
+        q_flat = x[i0:i0 + self._nx_q]; i0 += self._nx_q
+        dq_flat = x[i0:i0 + self._nx_dq]; i0 += self._nx_dq
+        face_flat = x[i0:i0 + self._nx_face]; i0 += self._nx_face
+        tab_flat = x[i0:i0 + self._nx_tab]; i0 += self._nx_tab
+
+        q_traj = q_flat.reshape(N+1, 6)
+        dq_traj = dq_flat.reshape(N, 6)
+        s_face_term = float(face_flat.reshape(1,)[0])
+
+        if self.use_lowest_sphere_for_table:
+            s_tab = tab_flat.reshape(N, M)
+        else:
+            s_tab = tab_flat.reshape(N,)
+
+        return q_traj, dq_traj, s_face_term, s_tab
+
+    # -----------------------------
+    # Geometry & Errors
+    # -----------------------------
+    def _sphere_centers_from_q(self, q_k):
+        """
+        Returns stacked centers [c1; c2; ...] where
+          c_i(q) = p(q) + R(q) * offset_i
+        """
+        p = self.fk_p(q_k)
+        R = self.fk_R(q_k)
+        centers = []
+        for off in self.sphere_offsets_ee:
+            off_sx = ca.SX(off)
+            centers.append(p + R @ off_sx)
+        return ca.vertcat(*centers)
+
+    def _orientation_error_log(self, R, R_goal):
+        """ e_R = Log( R_goal^T * R ) in R^3 (axis-angle vector) """
+        Rerr = R_goal.T @ R
+        tr = ca.trace(Rerr)
+        cos_theta = (tr - 1) / 2
+        cos_theta = ca.fmin(1.0, ca.fmax(-1.0, cos_theta))
+        theta = ca.acos(cos_theta)
+
+        vee = ca.vertcat(
+            Rerr[2, 1] - Rerr[1, 2],
+            Rerr[0, 2] - Rerr[2, 0],
+            Rerr[1, 0] - Rerr[0, 1]
         )
 
-    # ------------------------------------------------------------------
-    # MPC solve
-    # ------------------------------------------------------------------
-    def compute_control(self, current_state, target_state):
-        """
-        Compute optimal next joint command + predicted trajectory.
+        eps = 1e-6
+        scale = ca.if_else(theta < eps, 0.5, theta / (2 * ca.sin(theta)))
+        return scale * vee
 
-        Args:
-            current_state: [q, dq] array of shape (2*n_joints,).
-            target_state: target joint positions (n_joints,).
+    # -----------------------------
+    # CasADi model builders
+    # -----------------------------
+    def _build_point_aabb_distance_function(self, name="dist_point_aabb"):
+        p = ca.SX.sym("p", 3)
+        b = ca.SX.sym("b", 6)  # xmin,xmax,ymin,ymax,zmin,zmax
+
+        xmin, xmax, ymin, ymax, zmin, zmax = b[0], b[1], b[2], b[3], b[4], b[5]
+
+        cx = ca.fmin(ca.fmax(p[0], xmin), xmax)
+        cy = ca.fmin(ca.fmax(p[1], ymin), ymax)
+        cz = ca.fmin(ca.fmax(p[2], zmin), zmax)
+
+        c = ca.vertcat(cx, cy, cz)
+        d = ca.norm_2(p - c)
+        return ca.Function(name, [p, b], [d], ["p", "bounds"], ["d"])
+
+    def _build_ur7e_fk_functions_tool0(self):
+        """
+        POE FK -> wrist_3_link, then apply wrist3->tool0 transform.
 
         Returns:
-            q_next: (n_joints,) next-step command.
-            q_traj: (H+1, n_joints) full predicted trajectory.
+          fk_T(q)->4x4, fk_p(q)->3x1, fk_R(q)->3x3 for tool0 in base_link frame.
         """
-        q_current = np.asarray(current_state[: self.n_joints], dtype=float)
-        dq_current = np.asarray(current_state[self.n_joints:], dtype=float)
-        q_target = np.asarray(target_state, dtype=float)
+        q = ca.SX.sym("q", 6)
 
-        # Warm start: use current velocity to extrapolate motion
-        if self.prev_solution is None:
-            x0 = np.zeros(self.n_joints * (self.horizon + 1), dtype=float)
-            for k in range(self.horizon + 1):
-                # Linear interpolation with velocity-aware extrapolation for first few steps
-                alpha = k / self.horizon
-                if k == 0:
-                    # First step: current position
-                    x0[k * self.n_joints : (k + 1) * self.n_joints] = q_current
-                elif k == 1:
-                    # Second step: extrapolate using current velocity
-                    x0[k * self.n_joints : (k + 1) * self.n_joints] = (
-                        q_current + dq_current * self.dt
-                    )
-                else:
-                    # Remaining steps: interpolate toward target
-                    x0[k * self.n_joints : (k + 1) * self.n_joints] = (
-                        (1.0 - alpha) * q_current + alpha * q_target
-                    )
-        else:
-            x0 = np.zeros(self.n_joints * (self.horizon + 1), dtype=float)
-            x0[: self.n_joints * self.horizon] = self.prev_solution[self.n_joints :]
-            x0[self.n_joints * self.horizon :] = self.prev_solution[-self.n_joints :]
+        # UR7e geometry (same as your original)
+        q0 = ca.DM.zeros(3, 6)
+        q0[:, 0] = ca.vertcat(0.,     0.,      0.1625)
+        q0[:, 1] = ca.vertcat(0.,     0.,      0.1625)
+        q0[:, 2] = ca.vertcat(0.425,  0.,      0.1625)
+        q0[:, 3] = ca.vertcat(0.817,  0.1333,  0.1625)
+        q0[:, 4] = ca.vertcat(0.817,  0.1333,  0.06285)
+        q0[:, 5] = ca.vertcat(0.817,  0.233,   0.06285)
 
-        # Obstacles params
-        obs_pos_flat = np.zeros(3 * self.n_max_obstacles, dtype=float)
-        obs_size_flat = np.zeros(3 * self.n_max_obstacles, dtype=float)
-        n_active = min(len(self.obstacles), self.n_max_obstacles)
+        w0 = ca.DM.zeros(3, 6)
+        w0[:, 0] = ca.vertcat(0., 0.,  1.)
+        w0[:, 1] = ca.vertcat(0., 1.,  0.)
+        w0[:, 2] = ca.vertcat(0., 1.,  0.)
+        w0[:, 3] = ca.vertcat(0., 1.,  0.)
+        w0[:, 4] = ca.vertcat(0., 0., -1.)
+        w0[:, 5] = ca.vertcat(0., 1.,  0.)
 
-        for i, (pos, size) in enumerate(self.obstacles[: self.n_max_obstacles]):
-            obs_pos_flat[i * 3 : (i + 1) * 3] = pos
-            obs_size_flat[i * 3 : (i + 1) * 3] = size
+        R_zero = ca.DM([
+            [-1., 0., 0.],
+            [ 0., 0., 1.],
+            [ 0., 1., 0.]
+        ])
 
-        params = np.concatenate(
-            [q_current, dq_current, q_target, obs_pos_flat, obs_size_flat, np.array([n_active], dtype=float)]
-        )
+        gst0 = ca.DM.eye(4)
+        gst0[0:3, 0:3] = R_zero
+        gst0[0:3, 3] = q0[:, 5]
 
-        try:
-            sol = self.solver(
-                x0=x0,
-                lbx=self.lbx,
-                ubx=self.ubx,
-                lbg=self.lbg,
-                ubg=self.ubg,
-                p=params,
-            )
+        # Twists
+        xi = ca.SX.zeros(6, 6)
+        for i in range(6):
+            omega = ca.SX(w0[:, i])
+            q_point = ca.SX(q0[:, i])
+            v = -ca.cross(omega, q_point)
+            xi[0:3, i] = v
+            xi[3:6, i] = omega
 
-            x_opt = np.array(sol["x"].full().flatten(), dtype=float)
-            self.prev_solution = x_opt.copy()
-            q_opt = x_opt.reshape(self.horizon + 1, self.n_joints)
+        def exp_twist(xi_vec, theta):
+            v = xi_vec[0:3]
+            omega = xi_vec[3:6]
 
-            q_next = q_opt[1].copy()
-            return q_next, q_opt
+            wx = ca.SX.zeros(3, 3)
+            wx[0, 1] = -omega[2]
+            wx[0, 2] =  omega[1]
+            wx[1, 0] =  omega[2]
+            wx[1, 2] = -omega[0]
+            wx[2, 0] = -omega[1]
+            wx[2, 1] =  omega[0]
 
-        except Exception as e:
-            print(f"MPC solve failed: {e}, using fallback joint-space step.")
-            alpha = 0.05
-            q_next = (1.0 - alpha) * q_current + alpha * q_target
-            q_traj = np.tile(q_next, (self.horizon + 1, 1))
-            return q_next, q_traj
+            I3 = ca.SX.eye(3)
+            R = I3 + ca.sin(theta) * wx + (1 - ca.cos(theta)) * (wx @ wx)
+            V = I3 * theta + (1 - ca.cos(theta)) * wx + (theta - ca.sin(theta)) * (wx @ wx)
+            p = V @ v
+
+            g = ca.SX.eye(4)
+            g[0:3, 0:3] = R
+            g[0:3, 3] = p
+            return g
+
+        T = ca.SX.eye(4)
+        for i in range(6):
+            T = T @ exp_twist(xi[:, i], q[i])
+
+        T_wrist3 = T @ ca.SX(gst0)
+
+        R_tool = ca.DM(self.R_wrist3_tool0)
+        p_tool = ca.DM(self.p_wrist3_tool0)
+
+        T_wrist3_tool0 = ca.DM.eye(4)
+        T_wrist3_tool0[0:3, 0:3] = R_tool
+        T_wrist3_tool0[0:3, 3] = p_tool
+
+        T_tool0 = T_wrist3 @ ca.SX(T_wrist3_tool0)
+
+        p_ee = T_tool0[0:3, 3]
+        R_ee = T_tool0[0:3, 0:3]
+
+        fk_T = ca.Function("fk_T_tool0_base", [q], [T_tool0], ["q"], ["T_ee"])
+        fk_p = ca.Function("fk_p_tool0_base", [q], [p_ee], ["q"], ["p_ee"])
+        fk_R = ca.Function("fk_R_tool0_base", [q], [R_ee], ["q"], ["R_ee"])
+        return fk_T, fk_p, fk_R
+
+
+if __name__ == "__main__":
+    mpc = MPCController(N=15, cube_side=0.05, safety_margin=0.01)
+    q0 = np.zeros(6)
+    p_goal = np.array([0.5, 0.0, 0.25])
+    R_goal = np.eye(3)
+    aabb = np.array([0.3, 0.4, -0.1, 0.1, 0.0, 0.25])
+    out = mpc.solve(q0, p_goal, R_goal, aabb, pickup_height=0.0)
+    print("success:", out["success"], "status:", out["solver_status"])
+    print("dq0:", out["dq0"])
+    print("q_next:", out["q_next"])
+    print("s_face_term:", out["s_face"])
