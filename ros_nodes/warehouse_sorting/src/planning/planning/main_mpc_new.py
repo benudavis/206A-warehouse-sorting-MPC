@@ -20,6 +20,14 @@ from rclpy.time import Time
 import numpy as np
 import casadi as ca
 
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+
+from builtin_interfaces.msg import Duration
+from control_msgs.msg import JointTolerance
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 
 def wrap_to_pi(a: np.ndarray) -> np.ndarray:
     """Wrap angles to (-pi, pi]."""
@@ -41,6 +49,24 @@ class UR7e_CubeGrasp(Node):
     def __init__(self):
         super().__init__('cube_grasp')
 
+        # RViz visualization publisher
+        self.mpc_viz_pub = self.create_publisher(
+            MarkerArray,
+            "/mpc_viz",
+            10
+        )
+
+        self.action_cb_group = ReentrantCallbackGroup()
+        # -----------------------------
+        # Visualization options
+        # -----------------------------
+        self.viz_show_ee_line = True
+        self.viz_show_ee_points = True
+        self.viz_show_sphere_lines = True
+        self.viz_show_sphere_points = False 
+        self.viz_stride = 1
+        self.viz_lifetime_s = 0.35
+
         # -----------------------------
         # Subscriptions
         # -----------------------------
@@ -55,14 +81,14 @@ class UR7e_CubeGrasp(Node):
         )
 
         # -----------------------------
-        # Action client for arm trajectories
+        # Action client & Gripper
         # -----------------------------
         self.exec_ac = ActionClient(
             self, FollowJointTrajectory,
-            '/scaled_joint_trajectory_controller/follow_joint_trajectory'
+            '/scaled_joint_trajectory_controller/follow_joint_trajectory',
+            callback_group=self.action_cb_group
         )
 
-        # Service client for gripper (toggle)
         self.gripper_cli = self.create_client(Trigger, '/toggle_gripper')
 
         # TF (fallback only)
@@ -74,14 +100,14 @@ class UR7e_CubeGrasp(Node):
         # -----------------------------
         self.red_drop_location = PointStamped()
         self.red_drop_location.header.frame_id = "base_link"
-        self.red_drop_location.point.x = -0.37
-        self.red_drop_location.point.y = 0.47
+        self.red_drop_location.point.x = -0.47
+        self.red_drop_location.point.y = 0.43
         self.red_drop_location.point.z = -0.03
 
         self.blue_drop_location = PointStamped()
         self.blue_drop_location.header.frame_id = "base_link"
-        self.blue_drop_location.point.x = -0.37
-        self.blue_drop_location.point.y = 0.68
+        self.blue_drop_location.point.x = -0.47
+        self.blue_drop_location.point.y = 0.55
         self.blue_drop_location.point.z = -0.03
 
         # -----------------------------
@@ -89,52 +115,45 @@ class UR7e_CubeGrasp(Node):
         # -----------------------------
         self.joint_state = None
         self.initial_joint_state = None
-        self.cube_queue = []         # list of (PointStamped, color, drop_location)
+        self.cube_queue = []         
         self.processing_cube = False
-        self.completed_cubes = []    # list of (x, y, z)
+        self.completed_cubes = []    
         self.current_cube_pose = None
         self.current_cube_color = None
-
-        self.obstacle_aabb = None  # np.array([xmin,xmax,ymin,ymax,zmin,zmax])
+        self.obstacle_aabb = None 
 
         # Planning
         self.ik_planner = IKPlanner()
         self.job_queue = []
 
         # MPC
-        # NOTE:
-        #  - obstacle avoidance is HARD in the controller now
-        #  - facing-down enforced ONLY at terminal (k=N)
-        self.mpc = MPCController(N=30, dt=0.1, cube_side=0.05, safety_margin=0.01)
+        self.mpc = MPCController(N=30, dt=0.08, cube_side=0.05, safety_margin=0.01)
         self.mpc_R_goal = np.array([
             [1.0,  0.0,  0.0],
             [0.0, -1.0,  0.0],
             [0.0,  0.0, -1.0],
         ], dtype=float)
 
-        # Closed-loop MPC parameters
         self.mpc_max_iters = 40
         self.mpc_goal_tol_m = 0.03
-
-        # RECOMMENDED: shorten step, reduces “AABB changed during execution” risk
         self.mpc_step_duration = 0.15
 
         self._mpc_active = False
         self._mpc_iter = 0
-        self._mpc_goal = None          # np.array(3,)
-        self._mpc_pickup_h = None      # float
-        self._mpc_drop_location = None # PointStamped
+        self._mpc_goal = None          
+        self._mpc_pickup_h = None      
+        self._mpc_job_type = None      
 
-        # Joint mapping (JS order -> MPC order)
         self._joint_map_ready = False
         self._idx_mpc_from_js = None
         self._idx_js_from_mpc = None
+        
+        # -----------------------------
+        # Constraints
+        # -----------------------------
+        self.table_height_constraint = -0.45 
+        
 
-        self.get_logger().info(
-            f"[debug:init] MPCController: N={getattr(self.mpc,'N',None)} dt={getattr(self.mpc,'dt',None)} "
-            f"has_fk_p={hasattr(self.mpc,'fk_p')} has_fk_R={hasattr(self.mpc,'fk_R')} "
-            f"has_solve={hasattr(self.mpc,'solve')}"
-        )
         self.get_logger().info("main_waypoints node started")
 
     # --------------------------------------------------------------------------
@@ -154,19 +173,15 @@ class UR7e_CubeGrasp(Node):
             self.initial_joint_state.velocity = list(msg.velocity) if msg.velocity else []
             self.initial_joint_state.effort = list(msg.effort) if msg.effort else []
             self.get_logger().info("Stored initial/home joint state")
-            self.get_logger().info("Node is ready. Waiting for cube detections...")
 
     def obstacles_callback(self, msg: BoxBounds):
         self.obstacle_aabb = np.array(
             [msg.x_min, msg.x_max, msg.y_min, msg.y_max, msg.z_min, msg.z_max],
             dtype=float
         )
-        self.get_logger().info(f"[debug:obstacle] aabb={self.obstacle_aabb.tolist()}")
 
     def labeled_cubes_callback(self, msg: LabeledCubeArray):
-        if self.joint_state is None:
-            return
-        if self.processing_cube:
+        if self.joint_state is None or self.processing_cube:
             return
 
         for labeled_cube in msg.cubes:
@@ -186,10 +201,7 @@ class UR7e_CubeGrasp(Node):
                         Time()
                     )
                     cube_pose_base = do_transform_point(cube_pose_stamped, transform)
-                except Exception as e:
-                    self.get_logger().error(
-                        f"[debug:cubes] TF failed from {cube_pose_stamped.header.frame_id} to base_link: {e}"
-                    )
+                except Exception:
                     continue
             else:
                 cube_pose_base = cube_pose_stamped
@@ -203,12 +215,7 @@ class UR7e_CubeGrasp(Node):
 
             drop_location = self.red_drop_location if labeled_cube.color_label == 'red' else self.blue_drop_location
             self.cube_queue.append((cube_pose_base, labeled_cube.color_label, drop_location))
-
-            self.get_logger().info(
-                f"Queued {labeled_cube.color_label} cube at "
-                f"({cx:.3f}, {cy:.3f}, {cz:.3f}) "
-                f"→ drop at ({drop_location.point.x:.3f}, {drop_location.point.y:.3f}, {drop_location.point.z:.3f})"
-            )
+            self.get_logger().info(f"Queued {labeled_cube.color_label} cube")
 
         if self.cube_queue and not self.processing_cube:
             self._process_next_cube()
@@ -217,37 +224,14 @@ class UR7e_CubeGrasp(Node):
     # Joint order mapping
     # --------------------------------------------------------------------------
     def _build_joint_mapping(self, joint_names):
-        expected_mpc = [
-            "shoulder_pan_joint",
-            "shoulder_lift_joint",
-            "elbow_joint",
-            "wrist_1_joint",
-            "wrist_2_joint",
-            "wrist_3_joint",
-        ]
-
+        expected_mpc = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
         name_to_idx = {n: i for i, n in enumerate(joint_names)}
         try:
-            idx_mpc_from_js = [name_to_idx[n] for n in expected_mpc]
-        except KeyError as e:
-            self.get_logger().error(f"[joint_map] missing joint in /joint_states: {e}")
+            self._idx_mpc_from_js = [name_to_idx[n] for n in expected_mpc]
+            self._joint_map_ready = True
+        except KeyError:
             return
-
-        # quick round-trip check
-        if self.joint_state and self.joint_state.position and len(self.joint_state.position) >= 6:
-            q_js = np.array(self.joint_state.position, dtype=float)
-            q_mpc = q_js[idx_mpc_from_js]
-            q_js_rt = q_js.copy()
-            q_js_rt[idx_mpc_from_js] = q_mpc
-            err = float(np.linalg.norm(q_js_rt - q_js))
-
-            self.get_logger().info(f"[joint_map] joint_states order: {', '.join(joint_names)}")
-            self.get_logger().info(f"[joint_map] MPC FK expects:      {', '.join(expected_mpc)}")
-            self.get_logger().info(f"[joint_map] indices (MPC<-JS): {idx_mpc_from_js} (i.e., q_mpc = q_js[these])")
-            self.get_logger().info(f"[joint_map] round-trip ||q_js_rt - q_js|| = {err:.6e}")
-
-        self._idx_mpc_from_js = idx_mpc_from_js
-        self._joint_map_ready = True
 
     def _q_js_to_q_mpc(self, q_js):
         q_js = np.asarray(q_js, dtype=float).reshape(-1)
@@ -256,20 +240,145 @@ class UR7e_CubeGrasp(Node):
     def _q_mpc_to_q_js(self, q_mpc, q_js_current):
         q_mpc = np.asarray(q_mpc, dtype=float).reshape(6,)
         q_js_current = np.asarray(q_js_current, dtype=float).reshape(-1)
-
         q_js_target = q_js_current.copy()
         for mpc_i, js_i in enumerate(self._idx_mpc_from_js):
             q_js_target[js_i] = q_mpc[mpc_i]
-
         q_js_unwrapped = q_js_target.copy()
         for js_i in self._idx_mpc_from_js:
             q_js_unwrapped[js_i] = float(unwrap_to_nearest(q_js_current[js_i], q_js_target[js_i]))
-
         return q_js_unwrapped
 
     # --------------------------------------------------------------------------
     # Helpers
     # --------------------------------------------------------------------------
+    def _duration_msg(self, seconds: float) -> Duration:
+        sec = int(np.floor(seconds))
+        nanosec = int(np.round((seconds - sec) * 1e9))
+        if nanosec >= 1_000_000_000:
+            sec += 1
+            nanosec -= 1_000_000_000
+        return Duration(sec=sec, nanosec=nanosec)
+
+    def _viz_color_for_index(self, i: int, n: int, alpha: float = 1.0) -> ColorRGBA:
+        if n <= 1:
+            return ColorRGBA(r=0.0, g=1.0, b=1.0, a=float(alpha))
+        t = float(i) / float(max(1, n - 1))
+        r = float(0.15 + 0.85 * (1.0 - t))
+        g = float(0.20 + 0.80 * (t))
+        b = float(0.90 - 0.70 * abs(t - 0.5) * 2.0)
+        return ColorRGBA(r=r, g=g, b=b, a=float(alpha))
+
+    def _publish_mpc_viz(self, q_traj, p_goal, aabb, pickup_h=None):
+        ma = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        q_traj = np.asarray(q_traj, dtype=float)
+        p_goal = np.asarray(p_goal, dtype=float).reshape(3,)
+        aabb = np.asarray(aabb, dtype=float).reshape(6,)
+
+        stride = max(1, int(self.viz_stride))
+        idxs = list(range(0, q_traj.shape[0], stride))
+        if idxs[-1] != (q_traj.shape[0] - 1):
+            idxs.append(q_traj.shape[0] - 1)
+
+        lifetime = self._duration_msg(self.viz_lifetime_s)
+
+        if self.viz_show_ee_line:
+            path = Marker()
+            path.header.frame_id = "base_link"
+            path.header.stamp = now
+            path.ns = "mpc"
+            path.id = 0
+            path.type = Marker.LINE_STRIP
+            path.action = Marker.ADD
+            path.pose.orientation.w = 1.0
+            path.scale.x = 0.006
+            path.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+            path.lifetime = lifetime
+            for k in idxs:
+                p, _ = self._fk_ee(q_traj[k])
+                path.points.append(Point(x=float(p[0]), y=float(p[1]), z=float(p[2])))
+            ma.markers.append(path)
+
+        if self.viz_show_ee_points:
+            pts = Marker()
+            pts.header.frame_id = "base_link"
+            pts.header.stamp = now
+            pts.ns = "mpc"
+            pts.id = 3
+            pts.type = Marker.SPHERE_LIST
+            pts.action = Marker.ADD
+            pts.pose.orientation.w = 1.0
+            pts.scale.x = pts.scale.y = pts.scale.z = 0.05
+            pts.color = ColorRGBA(r=0.1, g=0.9, b=0.1, a=0.9)
+            pts.lifetime = lifetime
+            for k in idxs:
+                p, _ = self._fk_ee(q_traj[k])
+                pts.points.append(Point(x=float(p[0]), y=float(p[1]), z=float(p[2])))
+            ma.markers.append(pts)
+
+        goal = Marker()
+        goal.header.frame_id = "base_link"
+        goal.header.stamp = now
+        goal.ns = "mpc"
+        goal.id = 1
+        goal.type = Marker.SPHERE
+        goal.action = Marker.ADD
+        goal.pose.position.x = float(p_goal[0])
+        goal.pose.position.y = float(p_goal[1])
+        goal.pose.position.z = float(p_goal[2])
+        goal.pose.orientation.w = 1.0
+        goal.scale.x = goal.scale.y = goal.scale.z = 0.03
+        goal.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0)
+        goal.lifetime = lifetime
+        ma.markers.append(goal)
+
+        xmin, xmax, ymin, ymax, zmin, zmax = aabb.tolist()
+        box = Marker()
+        box.header.frame_id = "base_link"
+        box.header.stamp = now
+        box.ns = "mpc"
+        box.id = 2
+        box.type = Marker.CUBE
+        box.action = Marker.ADD
+        box.pose.position.x = 0.5 * (xmin + xmax)
+        box.pose.position.y = 0.5 * (ymin + ymax)
+        box.pose.position.z = 0.5 * (zmin + zmax)
+        box.pose.orientation.w = 1.0
+        box.scale.x = max(1e-6, (xmax - xmin))
+        box.scale.y = max(1e-6, (ymax - ymin))
+        box.scale.z = max(1e-6, (zmax - zmin))
+        box.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.30)
+        box.lifetime = lifetime
+        ma.markers.append(box)
+
+        if self.viz_show_sphere_lines or self.viz_show_sphere_points:
+            centers_list = []
+            for k in idxs:
+                centers_list.append(self._sphere_centers(q_traj[k]))
+            centers_over_h = np.stack(centers_list, axis=0) if centers_list else None
+
+            if centers_over_h is not None and centers_over_h.ndim == 3:
+                K, M, _ = centers_over_h.shape
+                if self.viz_show_sphere_lines:
+                    for j in range(M):
+                        m = Marker()
+                        m.header.frame_id = "base_link"
+                        m.header.stamp = now
+                        m.ns = "mpc_spheres"
+                        m.id = 10 + j
+                        m.type = Marker.LINE_STRIP
+                        m.action = Marker.ADD
+                        m.pose.orientation.w = 1.0
+                        m.scale.x = 0.004
+                        m.color = self._viz_color_for_index(j, M, alpha=0.95)
+                        m.lifetime = lifetime
+                        for kk in range(K):
+                            c = centers_over_h[kk, j, :]
+                            m.points.append(Point(x=float(c[0]), y=float(c[1]), z=float(c[2])))
+                        ma.markers.append(m)
+
+        self.mpc_viz_pub.publish(ma)
+
     def _is_near_completed(self, x, y, z, thresh=0.05) -> bool:
         for px, py, pz in self.completed_cubes:
             if np.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2) < thresh:
@@ -284,13 +393,6 @@ class UR7e_CubeGrasp(Node):
             if np.sqrt((x - qx) ** 2 + (y - qy) ** 2 + (z - qz) ** 2) < thresh:
                 return True
         return False
-
-    def _compute_mpc_approach_z(self, pickup_height: float, drop_z: float) -> float:
-        max_r = float(max(self.mpc.sphere_radii))
-        max_off_z = float(max([o[2] for o in self.mpc.sphere_offsets_ee]))
-        required_ee_z = float(pickup_height) + float(self.mpc.table_margin) + max_r + max_off_z
-        required_ee_z += 0.02
-        return max(float(drop_z) + 0.20, required_ee_z)
 
     def _fk_ee(self, q_mpc: np.ndarray):
         p = np.array(self.mpc.fk_p(ca.DM(q_mpc))).astype(float).reshape(3,)
@@ -314,7 +416,6 @@ class UR7e_CubeGrasp(Node):
         for i in range(M):
             d = float(self.mpc.dist_point_aabb(ca.DM(centers[i]), ca.DM(aabb)))
             obs_clear[i] = d - float(self.mpc.sphere_radii[i])
-
             thresh = float(pickup_height) + float(self.mpc.table_margin) + float(self.mpc.sphere_radii[i])
             tab_clear[i] = float(centers[i, 2]) - thresh
 
@@ -353,27 +454,21 @@ class UR7e_CubeGrasp(Node):
         self.execute_jobs()
 
     def _build_cube_job_queue(self, cube_pose: PointStamped, drop_location: PointStamped) -> bool:
-        if cube_pose.header.frame_id != "base_link":
-            self.get_logger().error(f"[debug:queue] Cube pose not base_link: {cube_pose.header.frame_id}")
-            self.job_queue = []
-            return False
-        if drop_location.header.frame_id != "base_link":
-            self.get_logger().error(f"[debug:queue] Drop not base_link: {drop_location.header.frame_id}")
-            self.job_queue = []
+        if cube_pose.header.frame_id != "base_link" or drop_location.header.frame_id != "base_link":
             return False
 
         self.job_queue = []
         cx, cy, cz = cube_pose.point.x, cube_pose.point.y, cube_pose.point.z
 
-        # Pre-grasp
-        pre_x, pre_y, pre_z = cx + 0.005, cy - 0.030, cz + 0.183
+        # 1. Pre-Grasp (IK)
+        pre_x, pre_y, pre_z = cx + 0.005, cy - 0.030, cz + 0.185
         pre_grasp_js = self.ik_planner.compute_ik(self.joint_state, pre_x, pre_y, pre_z)
         if pre_grasp_js is None:
             self.get_logger().error("[debug:queue] IK failed for pre-grasp")
             return False
         self.job_queue.append(pre_grasp_js)
 
-        # Grasp
+        # 2. Grasp (IK)
         grasp_x, grasp_y, grasp_z = cx + 0.005, cy - 0.03, cz + 0.14
         grasp_js = self.ik_planner.compute_ik(self.joint_state, grasp_x, grasp_y, grasp_z)
         if grasp_js is None:
@@ -382,34 +477,40 @@ class UR7e_CubeGrasp(Node):
             return False
         self.job_queue.append(grasp_js)
 
+        # 3. Grip
         self.job_queue.append('toggle_grip')
 
+        # 4. MPC Sequence: Approach -> Descent -> Lift -> Return
         pickup_height = float(cz)
-        approach_z = self._compute_mpc_approach_z(pickup_height=pickup_height, drop_z=float(drop_location.point.z))
-        self.job_queue.append(('mpc_to_drop', drop_location, pickup_height, approach_z))
+        drop_z = float(drop_location.point.z)
+        approach_z = max(drop_z + 0.20, pickup_height + 0.20)
 
-        drop_x, drop_y, drop_z = drop_location.point.x, drop_location.point.y, drop_location.point.z
-        drop_js = self.ik_planner.compute_ik(self.joint_state, drop_x, drop_y, drop_z)
-        if drop_js is None:
-            self.get_logger().error("[debug:queue] IK failed for final drop")
-            self.job_queue = []
-            return False
-        self.job_queue.append(drop_js)
+        # A: MPC Approach (Hover above drop)
+        self.job_queue.append(('mpc_move', drop_location, pickup_height, approach_z, 'approach'))
 
+        # B: MPC Descent (Go down to drop) - Using MPC instead of IK to avoid failures
+        self.job_queue.append(('mpc_move', drop_location, pickup_height, drop_z, 'descent'))
+
+        # C: Release
         self.job_queue.append('toggle_grip')
 
-        if self.initial_joint_state is not None:
-            self.job_queue.append(('return_home', self.initial_joint_state))
+        # D: MPC Lift (Back to hover)
+        self.job_queue.append(('mpc_move', drop_location, pickup_height, approach_z, 'lift'))
 
-        pretty = []
-        for j in self.job_queue:
-            if isinstance(j, JointState):
-                pretty.append("JointState")
-            elif isinstance(j, tuple) and len(j) > 0:
-                pretty.append(f"tuple:{j[0]}")
-            else:
-                pretty.append(str(j))
-        self.get_logger().info(f"[debug:queue] job_types={pretty}")
+        # E: MPC Return Home
+        if self.initial_joint_state is not None:
+            q_home_js = np.array(self.initial_joint_state.position, dtype=float)
+            q_home_mpc = self._q_js_to_q_mpc(q_home_js)
+            p_home, _ = self._fk_ee(q_home_mpc)
+            
+            home_pt = PointStamped()
+            home_pt.header.frame_id = "base_link"
+            home_pt.point.x = float(p_home[0])
+            home_pt.point.y = float(p_home[1])
+            home_pt.point.z = float(p_home[2])
+
+            self.job_queue.append(('mpc_move', home_pt, pickup_height, None, 'return'))
+
         return True
 
     # --------------------------------------------------------------------------
@@ -418,40 +519,20 @@ class UR7e_CubeGrasp(Node):
     def execute_jobs(self):
         if not self.job_queue:
             self.get_logger().info("[debug:jobs] done with cube job queue")
-
             if self.current_cube_pose is not None:
                 px, py, pz = self.current_cube_pose.point.x, self.current_cube_pose.point.y, self.current_cube_pose.point.z
                 self.completed_cubes.append((px, py, pz))
-                self.get_logger().info(f"[debug:jobs] marked completed ({px:.3f},{py:.3f},{pz:.3f})")
-
             self.current_cube_pose = None
             self.current_cube_color = None
             self.processing_cube = False
-
             if self.cube_queue:
                 self._process_next_cube()
             return
 
         next_job = self.job_queue.pop(0)
-        tag = (
-            'toggle_grip' if next_job == 'toggle_grip' else
-            (next_job[0] if isinstance(next_job, tuple) else
-             'JointState')
-        )
-        self.get_logger().info(f"[debug:jobs] pop job={type(next_job)} value={tag} remaining={len(self.job_queue)}")
+        self.get_logger().info(f"[debug:jobs] Executing job: {type(next_job)}")
 
-        # Return home
-        if isinstance(next_job, tuple) and len(next_job) == 2 and next_job[0] == 'return_home':
-            home_joint_state = next_job[1]
-            traj = self.ik_planner.plan_to_joints(home_joint_state)
-            if traj is None:
-                self.get_logger().error("[debug:home] MoveIt plan failed")
-                self._abort_cube()
-                return
-            self._execute_joint_trajectory(traj.joint_trajectory, segment_tag="moveit_home")
-            return
-
-        # MoveIt JointState
+        # IK Move (Pre-grasp / Grasp)
         if isinstance(next_job, JointState):
             traj = self.ik_planner.plan_to_joints(next_job)
             if traj is None:
@@ -461,30 +542,39 @@ class UR7e_CubeGrasp(Node):
             self._execute_joint_trajectory(traj.joint_trajectory, segment_tag="moveit_segment")
             return
 
-        # MPC closed-loop
-        if isinstance(next_job, tuple) and len(next_job) == 4 and next_job[0] == 'mpc_to_drop':
-            _, drop_location, pickup_height, approach_z = next_job
+        # MPC Move (Approach, Descent, Lift, Return)
+        # tuple format: ('mpc_move', target_pt, pickup_h, target_z, phase)
+        if isinstance(next_job, tuple) and len(next_job) == 5 and next_job[0] == 'mpc_move':
+            _, target_pt, pickup_h, target_z, phase = next_job
 
             if self.obstacle_aabb is None:
-                self.get_logger().error("[debug:mpc] obstacle_aabb is None (MPC will not run)")
+                self.get_logger().error("[debug:mpc] obstacle_aabb is None")
                 self._abort_cube()
                 return
 
             self._mpc_active = True
             self._mpc_iter = 0
-            self._mpc_drop_location = drop_location
+            self._mpc_job_type = phase
 
-            self._mpc_goal = np.array([drop_location.point.x, drop_location.point.y, float(approach_z)], dtype=float)
+            # Goal configuration
+            tx, ty = target_pt.point.x, target_pt.point.y
+            tz = target_z if target_z is not None else target_pt.point.z
+            self._mpc_goal = np.array([tx, ty, float(tz)], dtype=float)
 
+            # Floor constraint configuration based on Phase
             aabb = np.asarray(self.obstacle_aabb, dtype=float).reshape(6,)
-            pickup_height_eff = float(min(float(pickup_height), float(aabb[4])))
-            self._mpc_pickup_h = pickup_height_eff
+            
+            if phase == 'return':
+                # Force flying OVER the obstacle
+                self._mpc_pickup_h = float(aabb[5])
+            elif phase == 'descent':
+                # Going down: floor is the strict table height constraint (or even lower if needed)
+                self._mpc_pickup_h = self.table_height_constraint
+            else:
+                # Normal Transport: floor is the strict table height constraint
+                self._mpc_pickup_h = self.table_height_constraint
 
-            self.get_logger().info(
-                f"[debug:mpc] ENTER CLOSED-LOOP MPC mode p_goal=({self._mpc_goal[0]:.3f},{self._mpc_goal[1]:.3f},{self._mpc_goal[2]:.3f}) "
-                f"pickup_height={pickup_height_eff:.3f}"
-            )
-
+            self.get_logger().info(f"[MPC] Phase={phase} Goal={self._mpc_goal} Floor={self._mpc_pickup_h}")
             self._mpc_step_replan_and_execute()
             return
 
@@ -516,11 +606,9 @@ class UR7e_CubeGrasp(Node):
         if not self._mpc_active:
             return
         if self.joint_state is None or not self._joint_map_ready:
-            self.get_logger().warn("[mpc] missing joint_state or joint_map")
             self._abort_cube()
             return
         if self.obstacle_aabb is None:
-            self.get_logger().warn("[mpc] missing obstacle_aabb")
             self._abort_cube()
             return
 
@@ -541,13 +629,6 @@ class UR7e_CubeGrasp(Node):
         delta = p_goal - ee_p0
         dist0 = float(np.linalg.norm(delta))
 
-        self.get_logger().info(
-            f"[mpc] iter={self._mpc_iter} ee=({ee_p0[0]:.3f},{ee_p0[1]:.3f},{ee_p0[2]:.3f}) "
-            f"p_goal=({p_goal[0]:.3f},{p_goal[1]:.3f},{p_goal[2]:.3f}) "
-            f"delta=({delta[0]:.3f},{delta[1]:.3f},{delta[2]:.3f}) dist={dist0:.4f}"
-        )
-        self.get_logger().info(f"[mpc] aabb={aabb.tolist()} pickup_height={pickup_h:.3f}")
-
         if dist0 < self.mpc_goal_tol_m:
             self.get_logger().info(f"[mpc] goal reached within tol {self.mpc_goal_tol_m:.3f}m -> exit MPC")
             self._mpc_active = False
@@ -557,83 +638,23 @@ class UR7e_CubeGrasp(Node):
         out = self.mpc.solve(
             q0=q0_mpc,
             p_goal=p_goal,
-            R_goal=self.mpc_R_goal,  # terminal-only facing uses this only at k=N
+            R_goal=self.mpc_R_goal,
             aabb_bounds=aabb,
             pickup_height=pickup_h
         )
 
-        self.get_logger().info(f"[mpc] solve() success={out.get('success', False)} status={out.get('solver_status', 'unknown')}")
-
         if not out.get("success", False):
-            self.get_logger().error(f"[mpc] MPC failed. diagnostics={['ipopt_status']}")
+            self.get_logger().error(f"[mpc] MPC failed.")
             self._abort_cube()
             return
 
         q_traj = np.asarray(out["q_traj"], dtype=float)
         dq_traj = np.asarray(out["dq_traj"], dtype=float)
 
-        # First predicted step (k=1)
+        self._publish_mpc_viz(q_traj=q_traj, p_goal=p_goal, aabb=aabb, pickup_h=pickup_h)
+
+        # First predicted step
         q1_mpc = q_traj[1].copy() if q_traj.shape[0] >= 2 else (q0_mpc + dq_traj[0])
-
-        # Terminal facing slack (scalar)
-        s_face_term = float(out.get("s_face", 0.0))
-        s_tab = out.get("s_tab", None)
-        if s_tab is not None:
-            s_tab = np.asarray(s_tab, dtype=float)
-            tab_max = float(np.max(s_tab)) if s_tab.size else 0.0
-            tab_mean = float(np.mean(s_tab)) if s_tab.size else 0.0
-        else:
-            tab_max, tab_mean = 0.0, 0.0
-
-        self.get_logger().info(
-            f"[mpc][slacks] terminal_face={s_face_term:.4e} tab_max={tab_max:.4e} tab_mean={tab_mean:.4e}"
-        )
-
-        # First-step distance + clearance diagnostics
-        ee_p1, ee_R1 = self._fk_ee(q1_mpc)
-        dist1 = float(np.linalg.norm(ee_p1 - p_goal))
-
-        obs0, tab0 = self._clearances(q0_mpc, aabb, pickup_h)
-        obs1, tab1 = self._clearances(q1_mpc, aabb, pickup_h)
-
-        worst0 = int(np.argmin(obs0))
-        worst1 = int(np.argmin(obs1))
-        obsClear0 = float(obs0[worst0])
-        obsClear1 = float(obs1[worst1])
-
-        wtab0 = int(np.argmin(tab0))
-        wtab1 = int(np.argmin(tab1))
-        tabClear0 = float(tab0[wtab0])
-        tabClear1 = float(tab1[wtab1])
-
-        self.get_logger().info(
-            f"[mpc][first] dist0={dist0:.4f} dist1={dist1:.4f} dDist={dist1 - dist0:+.4f} | "
-            f"obsClear0={obsClear0:+.4f} obsClear1={obsClear1:+.4f} dObsClear={obsClear1-obsClear0:+.4f} | "
-            f"tabClear0={tabClear0:+.4f} tabClear1={tabClear1:+.4f} dTabClear={tabClear1-tabClear0:+.4f}"
-        )
-
-        # HARD constraint sanity warning: predicted first step should NOT violate obstacle clearance
-        if obsClear1 < -1e-6:
-            self.get_logger().error(
-                f"[mpc][HARD_VIOLATION?] predicted obsClear1={obsClear1:+.6f} < 0 "
-                f"(FK/AABB mismatch or controller not enforcing hard constraint)"
-            )
-
-        # Facing debug: show it but remember it's ONLY required at terminal now
-        z0 = ee_R0[:, 2]
-        z1 = ee_R1[:, 2]
-        dot0 = float(-z0[2])
-        dot1 = float(-z1[2])
-        lat0 = float(np.linalg.norm(z0[0:2]))
-        lat1 = float(np.linalg.norm(z1[0:2]))
-        self.get_logger().info(
-            f"[mpc][face_now] dot0={dot0:+.4f} dot1={dot1:+.4f} lat0={lat0:+.4f} lat1={lat1:+.4f} "
-            f"(NOTE: facing-down required only at terminal; this is just telemetry)"
-        )
-
-        dq0 = np.asarray(out["dq0"], dtype=float).reshape(6,)
-        self.get_logger().info(f"[mpc] step ||dq_ctrl||={float(np.linalg.norm(dq0)):.6f}")
-
         q1_js_unwrapped = self._q_mpc_to_q_js(q1_mpc, q_js)
 
         jt = self._one_step_joint_trajectory(q_js, q1_js_unwrapped, duration=self.mpc_step_duration)
@@ -702,22 +723,23 @@ class UR7e_CubeGrasp(Node):
     # Trajectory execution
     # --------------------------------------------------------------------------
     def _execute_joint_trajectory(self, joint_traj: JointTrajectory, segment_tag: str = "traj", on_done_cb=None):
-        try:
-            npts = len(joint_traj.points)
-            t0 = joint_traj.points[0].time_from_start.sec + 1e-9 * joint_traj.points[0].time_from_start.nanosec
-            tN = joint_traj.points[-1].time_from_start.sec + 1e-9 * joint_traj.points[-1].time_from_start.nanosec
-            qN = joint_traj.points[-1].positions
-            self.get_logger().info(
-                f"[debug:{segment_tag}] sending traj points={npts} T={tN - t0:.3f}s final_q={np.round(qN,3).tolist()}"
-            )
-        except Exception as e:
-            self.get_logger().warn(f"[debug:{segment_tag}] traj stats failed: {e}")
-
-        self.exec_ac.wait_for_server()
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = joint_traj
+        
+        # Tolerances to prevent hanging
+        goal.goal_time_tolerance = Duration(sec=0, nanosec=500_000_000) 
+        for name in joint_traj.joint_names:
+            tol = JointTolerance()
+            tol.name = name
+            tol.position = 0.01  
+            tol.velocity = 0.01
+            goal.goal_tolerance.append(tol)
 
-        self.get_logger().info(f"[debug:{segment_tag}] send_goal_async()")
+        if not self.exec_ac.wait_for_server(timeout_sec=2.0):
+             self.get_logger().error(f"[debug:{segment_tag}] Action server not available!")
+             self._abort_cube()
+             return
+
         send_future = self.exec_ac.send_goal_async(goal)
         send_future.add_done_callback(lambda fut: self._on_goal_sent(fut, segment_tag, on_done_cb))
 
@@ -732,7 +754,6 @@ class UR7e_CubeGrasp(Node):
                     self._abort_cube()
                 return
 
-            self.get_logger().info(f"[debug:{segment_tag}] goal accepted -> waiting result")
             res_future = goal_handle.get_result_async()
             res_future.add_done_callback(lambda fut: self._on_exec_done(fut, segment_tag, on_done_cb))
         except Exception as e:
@@ -747,13 +768,16 @@ class UR7e_CubeGrasp(Node):
             res = future.result().result
             ec = getattr(res, "error_code", None)
             es = getattr(res, "error_string", "")
-            self.get_logger().info(f"[debug:{segment_tag}] execution complete error_code={ec} error_string='{es}'")
             ok = (ec == 0)
 
             if on_done_cb:
                 on_done_cb(ok, es)
             else:
-                self.execute_jobs()
+                if ok:
+                    self.execute_jobs()
+                else:
+                    self.get_logger().error(f"Execution failed with code {ec}")
+                    self._abort_cube()
         except Exception as e:
             self.get_logger().error(f"[debug:{segment_tag}] execution result exception: {e}")
             if on_done_cb:
@@ -765,9 +789,17 @@ class UR7e_CubeGrasp(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = UR7e_CubeGrasp()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

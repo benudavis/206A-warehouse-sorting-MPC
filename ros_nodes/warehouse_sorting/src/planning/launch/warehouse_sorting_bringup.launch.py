@@ -115,7 +115,7 @@ def generate_launch_description():
     # Which AR marker to treat as reference
     ar_marker_launch_arg = DeclareLaunchArgument(
         'ar_marker',
-        default_value='ar_marker_7'  # match the marker ID most commonly detected in logs
+        default_value='ar_marker_6'  # match the marker ID most commonly detected in logs
     )
     ar_marker = LaunchConfiguration('ar_marker')
 
